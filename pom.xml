@@ -95,6 +95,35 @@
             <version>6.1.6.RELEASE</version>
         </dependency>
 
+        <!-- Elasticsearch：全文搜索引擎 -->
+        <!-- 【八股：为什么选ES而不是MySQL LIKE？】
+             1. MySQL LIKE '%keyword%' 无法走索引，全表扫描
+             2. MySQL不支持分词（搜索"好吃牛排"匹配不了"牛排很好吃"）
+             3. ES基于倒排索引，支持分词、高亮、相关度排序
+             4. ES支持聚合分析，MySQL做聚合性能差 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-elasticsearch</artifactId>
+        </dependency>
+
+        <!-- Jackson用于ES序列化 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <!-- Guava：RateLimiter令牌桶限流 -->
+        <!-- 【八股：为什么选Guava RateLimiter而不是Sentinel？】
+             1. 轻量级：无需独立Dashboard，嵌入应用即可运行
+             2. 单机限流足够：本项目单体架构，不需要分布式限流
+             3. 面试友好：能讲清令牌桶算法原理
+             如果是微服务架构，选Sentinel（支持集群限流、熔断降级、热点参数限流） -->
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>31.1-jre</version>
+        </dependency>
+
     </dependencies>
 
     <build>

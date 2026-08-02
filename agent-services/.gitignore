@@ -1,0 +1,21 @@
+.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# ChromaDB 向量数据
+chroma_data/
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python 打包产物
+*.egg-info/
+dist/
+build/
+
+# 日志
+*.log

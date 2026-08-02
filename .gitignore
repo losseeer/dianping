@@ -31,3 +31,20 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### 日志与临时文件 ###
+*.log
+logs/
+.uploads/
+
+### Trae / WorkBuddy ###
+.trae-html-share-packages/
+.workbuddy/
+.DS_Store
+
+### 个人文档
+docs/czk.jpg
+docs/resume*
+
+### Redis
+dump.rdb

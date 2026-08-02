@@ -1,32 +1,39 @@
-  server:
-    port: 8081
-  spring:
-    rabbitmq:
-      host: localhost
-      port: 5672
-      username: guest
-      password: guest
-    application:
-      name: hmdp
-    datasource:
-      driver-class-name: com.mysql.jdbc.Driver
-      url: jdbc:mysql://127.0.0.1:3306/dingping?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
-      username: root
-      password: 290390
-    redis:
-      host: 127.0.0.1
-      port: 6379
-
-      lettuce:
-        pool:
-          max-active: 30
-          max-idle: 15
-          min-idle: 5
-          time-between-eviction-runs: 10s
-    jackson:
-      default-property-inclusion: non_null # JSON处理时忽略非空字段
-  mybatis-plus:
-    type-aliases-package: com.hmdp.entity # 别名扫描包
-  logging:
-    level:
-      com.hmdp: debug
+server:
+  port: 8081
+spring:
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+  application:
+    name: hmdp
+  datasource:
+    driver-class-name: com.mysql.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/dingping?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+    username: root
+    # password 留空 — 本地 MySQL 无密码
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    lettuce:
+      pool:
+        max-active: 30
+        max-idle: 15
+        min-idle: 5
+        time-between-eviction-runs: 10s
+  jackson:
+    default-property-inclusion: non_null # JSON处理时忽略非空字段
+# Elasticsearch 配置
+# 【八股：ES的9200端口 vs 9300端口】
+# 9200：HTTP REST API端口，客户端用这个
+# 9300：TCP传输端口，集群节点间通信用这个
+# RestHighLevelClient底层用的就是9200端口的HTTP协议
+elasticsearch:
+  rest:
+    uris: http://127.0.0.1:9200
+mybatis-plus:
+  type-aliases-package: com.hmdp.entity # 别名扫描包
+logging:
+  level:
+    com.hmdp: debug

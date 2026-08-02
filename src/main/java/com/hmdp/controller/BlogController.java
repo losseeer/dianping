@@ -92,6 +92,17 @@ public class BlogController {
         List<Blog> records = page.getRecords();
         return Result.ok(records);
     }
+    @GetMapping("/of/shop")
+    public Result queryBlogByShopId(
+            @RequestParam("shopId") Long shopId,
+            @RequestParam(value = "current", defaultValue = "1") Integer current) {
+        // 按商铺ID分页查询评价，供 Agent 微服务调用
+        Page<Blog> page = blogService.query()
+                .eq("shop_id", shopId).page(new Page<>(current, SystemConstants.MAX_PAGE_SIZE));
+        List<Blog> records = page.getRecords();
+        return Result.ok(records);
+    }
+
     @GetMapping("/of/follow")
     public Result queryBlogOfFollow(
             @RequestParam("lastId") Long max,
