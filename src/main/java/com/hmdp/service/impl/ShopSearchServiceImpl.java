@@ -8,7 +8,11 @@ import com.hmdp.dto.ShopSearchResult;
 import com.hmdp.entity.Shop;
 import com.hmdp.repository.ShopDocRepository;
 import com.hmdp.service.IShopService;
+import com.hmdp.annotation.CircuitBreaker;
 import com.hmdp.service.IShopSearchService;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import lombok.extern.slf4j.Slf4j;
 import org.elasticsearch.index.query.BoolQueryBuilder;
 import org.elasticsearch.index.query.QueryBuilders;
 import org.elasticsearch.search.fetch.subphase.highlight.HighlightBuilder;
@@ -70,6 +74,7 @@ import java.util.Map;
  *   FST将词项表加载到内存，Posting List存在磁盘
  *   搜索时先在内存FST中查到词项位置，再去磁盘读Posting List
  */
+@Slf4j
 @Service
 public class ShopSearchServiceImpl implements IShopSearchService {
 
@@ -190,6 +195,8 @@ public class ShopSearchServiceImpl implements IShopSearchService {
      * 本项目使用from + size分页，适用于浅分页场景（前几页）。
      */
     @Override
+    @CircuitBreaker(failureThreshold = 5, recoveryTimeout = 30000, slidingWindow = 60000,
+            fallback = "searchFallback")
     public Result search(String keyword, Long typeId, String area, Integer current, Integer size) {
         // 1.参数校验与默认值处理
         if (current == null || current < 1) {
@@ -283,6 +290,83 @@ public class ShopSearchServiceImpl implements IShopSearchService {
         result.setCurrent(current);
         result.setSize(size);
 
+        return Result.ok(result);
+    }
+
+    /**
+     * ES 搜索熔断降级方法 —— MySQL LIKE 查询
+     *
+     * 【八股：熔断降级的 fallback 设计原则】
+     * 1. 降级方法必须与原方法签名完全一致（参数列表、返回类型）
+     * 2. 降级逻辑应尽量轻量，避免再次触发熔断
+     * 3. 降级返回的数据可以是"次优"的，但不能是"错误"的
+     * 4. 降级方法中不应该再调用可能失败的外部服务
+     *
+     * 【八股：MySQL LIKE vs ES 全文搜索的性能差异】
+     * - MySQL LIKE '%keyword%'：全表扫描，O(n)，无法利用索引
+     * - ES 倒排索引：直接定位文档，接近 O(1)
+     * - 数据量小时（<1万条）MySQL LIKE 也能接受
+     * - 数据量大时（>10万条）必须用 ES，否则响应时间秒级
+     *
+     * 降级场景：ES 不可用时（OOM、节点宕机、网络超时），
+     * 用 MySQL LIKE 兜底保证搜索功能可用，虽然慢但有结果。
+     */
+    private Result searchFallback(String keyword, Long typeId, String area,
+                                   Integer current, Integer size) {
+        // 1. 参数校验
+        if (current == null || current < 1) current = 1;
+        if (size == null || size < 1) size = 10;
+
+        log.warn("ES 搜索熔断降级，使用 MySQL LIKE 查询: keyword={}, typeId={}, area={}",
+                keyword, typeId, area);
+
+        long startTime = System.currentTimeMillis();
+
+        // 2. 构建 MySQL 查询条件（MyBatis-Plus LambdaQueryWrapper）
+        LambdaQueryWrapper<Shop> wrapper = new LambdaQueryWrapper<>();
+
+        // 关键词搜索：在 name、area、address 中 LIKE 匹配（等价于 ES 的 multi_match）
+        if (StrUtil.isNotBlank(keyword)) {
+            wrapper.and(w -> w.like(Shop::getName, keyword)
+                    .or().like(Shop::getArea, keyword)
+                    .or().like(Shop::getAddress, keyword));
+        }
+
+        // 类型过滤（等价于 ES 的 filter termQuery）
+        if (typeId != null) {
+            wrapper.eq(Shop::getTypeId, typeId);
+        }
+
+        // 商圈过滤
+        if (StrUtil.isNotBlank(area)) {
+            wrapper.like(Shop::getArea, area);
+        }
+
+        // 排序：先按评分降序，再按销量降序（等价于 ES 的 fieldSort）
+        wrapper.orderByDesc(Shop::getScore);
+        wrapper.orderByDesc(Shop::getSold);
+
+        // 3. 分页查询 MySQL
+        Page<Shop> page = new Page<>(current, size);
+        Page<Shop> shopPage = shopService.page(page, wrapper);
+
+        // 4. 转换为 ShopDoc（复用已有的转换方法）
+        List<ShopDoc> shopDocList = new ArrayList<>();
+        for (Shop shop : shopPage.getRecords()) {
+            shopDocList.add(convertToShopDoc(shop));
+        }
+
+        long took = System.currentTimeMillis() - startTime;
+
+        // 5. 封装返回结果
+        ShopSearchResult result = new ShopSearchResult();
+        result.setList(shopDocList);
+        result.setTotal(shopPage.getTotal());
+        result.setTook(took);
+        result.setCurrent(current);
+        result.setSize(size);
+
+        log.info("MySQL 降级查询完成: total={}, took={}ms", shopPage.getTotal(), took);
         return Result.ok(result);
     }
 
