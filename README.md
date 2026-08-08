@@ -1,6 +1,6 @@
-# 🍽️ 黑马点评 (HmDianPing)
+# 🍽️ 快评——高并发本地生活服务平台
 
-> 基于 SpringBoot + Redis 的本地生活点评平台，涵盖商户搜索、秒杀抢券、好友关注、探店分享等核心场景，并集成 LLM Agent 实现智能评价分析与个性化推荐。
+> 基于 Spring Boot + Redis 的本地生活服务平台，覆盖商户搜索、秒杀抢券、支付退款、社交互动等核心场景，并通过 FastAPI 接入 LLM Agent，实现评价摘要与个性化推荐。
 
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-2.3.12-brightgreen.svg)](https://spring.io/projects/spring-boot)
 [![JDK](https://img.shields.io/badge/JDK-1.8-orange.svg)](https://www.oracle.com/java/)
@@ -26,9 +26,9 @@
 
 ## 项目简介
 
-黑马点评是一个**前后端分离**的本地生活服务点评平台，类似大众点评。项目以 **Redis 为核心**，深度运用其多种数据结构实现高性能业务场景，同时集成 **RabbitMQ** 消息队列、**Elasticsearch** 全文搜索，以及基于 **LangChain/LangGraph** 的 LLM Agent 智能服务。
+快评是一个**前后端分离**的本地生活服务平台，面向商户搜索、优惠券秒杀、支付退款和内容互动等场景。项目以 **Redis 为核心**，综合使用 Redis 多种数据结构、RabbitMQ、Elasticsearch，以及基于 **LangChain/LangGraph** 的 LLM Agent 微服务，形成 Java 交易后端与 Python 智能服务协作的架构。
 
-### 核心业务闭环（12 个模块全部完整）
+### 核心业务模块
 
 | # | 模块 | 核心技术 |
 |---|------|----------|
@@ -40,7 +40,7 @@
 | 6 | 用户签到 | BitMap 位图 + 位运算连续签到统计 |
 | 7 | 好友关注 | Set 集合交集求共同关注 |
 | 8 | 达人探店 | ZSet 点赞排行榜 + Blog 发布 |
-| 9 | 博客评论 | 评论 CRUD + 点赞（✅ 已补全） |
+| 9 | 博客评论 | 评论 CRUD + 点赞 |
 | 10 | 支付闭环 | 发起支付 → 回调确认 → 退款 → 订单超时取消 |
 | 11 | 推荐系统 | 协同过滤 + GEO 附近热门 + 全站排行 + 熔断降级 |
 | 12 | 全文搜索 | Elasticsearch + IK 分词 + 高亮 + 相关度排序 |
@@ -132,7 +132,7 @@
 | **GEO** | 附近商铺搜索（按距离排序） | `shop:geo` |
 | **BitMap** | 用户签到（按月统计） | `sign:{userId}:{yyyyMM}` |
 | **HyperLogLog** | UV 独立访客统计 | `uv:page:{pageId}` |
-| **Stream (已升级为 RabbitMQ)** | 秒杀异步下单 | — |
+| **Redis Stream** | 历史秒杀异步下单方案（当前使用 RabbitMQ） | `stream.orders`（旧方案注释） |
 | **Lua 脚本** | 秒杀资格原子预检 | `seckill.lua` |
 
 ### 核心流程
@@ -243,14 +243,16 @@ dianping/
 │       │   ├── routing.py           # 条件路由
 │       │   ├── utils.py             # 计时/JSON 解析
 │       │   └── builder.py           # build_graph()
-│       ├── harness/                 # 自改进层
-│       │   ├── playbook.py          # 经验库 + RAG
-│       │   ├── memory.py            # 用户记忆
+│       ├── memory/                  # 分层记忆与经验库
+│       │   ├── user.py              # 用户偏好记忆
 │       │   ├── conversation.py      # 会话上下文
 │       │   ├── trajectory.py        # 轨迹存储
-│       │   ├── evaluator.py         # Benchmark
+│       │   └── playbook.py          # Playbook 经验库 + RAG
+│       ├── improve/                 # 反思与自改进
 │       │   ├── reflect.py           # 反思自评
-│       │   └── self_improve.py      # 自改进引擎
+│       │   └── self_improve.py      # Self-Harness 实验框架
+│       ├── eval/                    # Agent 评测
+│       │   └── runner.py            # Benchmark / A-B 评测
 │       └── .env.example             # 环境变量示例
 └── docs/                            # 文档
     ├── SETUP.md                     # 中间件配置指南
@@ -277,7 +279,7 @@ dianping/
 ```bash
 # 1. 启动中间件
 docker run -d --name mysql -p 3306:3306 \
-  -e MYSQL_ROOT_PASSWORD=290390 -e MYSQL_DATABASE=dingping mysql:8.0
+  -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=dingping mysql:8.0
 
 docker run -d --name redis -p 6379:6379 redis:7-alpine
 
@@ -285,7 +287,7 @@ docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 \
   -e RABBITMQ_DEFAULT_USER=guest -e RABBITMQ_DEFAULT_PASS=guest rabbitmq:3-management
 
 # 2. 导入数据库
-mysql -h 127.0.0.1 -u root -p290390 dingping < src/main/resources/db/hmdp.sql
+mysql -h 127.0.0.1 -u root dingping < src/main/resources/db/hmdp.sql
 
 # 3. 启动 Java 后端
 export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-1.8.jdk/Contents/Home
@@ -323,6 +325,7 @@ cd agent-services && bash start.sh
 | GET | `/shop-type/list` | 商户类型列表 |
 | GET | `/shop/search` | ES 全文搜索（关键词+类型+商圈） |
 | POST | `/shop/search/sync` | 全量同步到 ES |
+| POST | `/shop/search/import` | 单条商户导入 ES |
 
 ### 秒杀模块
 
@@ -339,6 +342,14 @@ cd agent-services && bash start.sh
 | POST | `/pay/notify` | 支付回调 |
 | POST | `/pay/refund/{id}` | 申请退款 |
 | POST | `/pay/refund/callback` | 退款回调 |
+
+### 订单模块
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/order/{id}` | 查询订单详情 |
+| GET | `/order/list` | 查询当前用户订单 |
+| POST | `/order/cancel/{id}` | 取消订单 |
 
 ### 社交模块
 
@@ -390,7 +401,7 @@ cd agent-services && bash start.sh
 
 ### 3. Redis + Lua 秒杀原子预检
 
-一条 Lua 脚本完成：库存检查 → 一人一单 → 扣库存 → 记录订单 → 发 MQ 消息，5 步合并为 1 次 Redis 调用。
+Lua 脚本完成：库存检查 → 一人一单 → 扣库存 → 记录订单，并返回订单 ID；Java 业务层收到结果后发送 RabbitMQ 消息，实现 Redis 原子预检与 MQ 异步下单解耦。
 
 ### 4. 死信队列实现订单超时取消
 
@@ -409,7 +420,7 @@ cd agent-services && bash start.sh
 ### 6. AOP 限流 + 熔断保护
 
 - **@RateLimit**：Guava RateLimiter 令牌桶，秒杀 50 QPS / 搜索 100 QPS / 验证码 1 QPS
-- **@CircuitBreaker**：手动熔断器（CLOSED → OPEN → HALF_OPEN），商铺查询降级返回空列表
+- **@CircuitBreaker**：手动熔断器（CLOSED → OPEN → HALF_OPEN），保护商铺详情和 ES 搜索；商铺详情熔断后直查 MySQL，ES 搜索熔断后使用 MySQL LIKE 兜底
 
 ---
 
