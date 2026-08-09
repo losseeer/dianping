@@ -59,15 +59,20 @@ docker run -d --name mysql \
 ### 2.2 初始化数据库
 
 ```bash
-# 导入电商业务表（tb_shop / tb_user / tb_voucher 等）
-mysql -h 127.0.0.1 -u root dingping < src/main/resources/db/hmdp.sql
+# 导入后端基础表（tb_shop / tb_user / tb_voucher 等）
+mysql -h 127.0.0.1 -u root dingping < sql/backend/schema/001_core.sql
 
 # 导入支付 & 搜索模块表（tb_pay_log 等）
-mysql -h 127.0.0.1 -u root dingping < sql/upgrade_payment_and_search.sql
+mysql -h 127.0.0.1 -u root dingping < sql/backend/schema/002_payment_and_search.sql
 
-# 导入 Agent 相关表（tb_agent_preferences / tb_agent_playbook / tb_agent_conversations）
-mysql -h 127.0.0.1 -u root dingping < sql/upgrade_agent_preferences.sql
+# 导入 Agent2 相关表（tb_agent_preferences / tb_agent_playbook / tb_agent_conversations）
+mysql -h 127.0.0.1 -u root dingping < sql/agent2/schema/001_agent_tables.sql
+
+# 可选：导入后端测试数据
+mysql -h 127.0.0.1 -u root dingping < sql/backend/data/001_test_data.sql
 ```
+
+Agent1 当前不持有独立 MySQL 表，详见 `sql/agent1/schema/README.md`。
 
 ### 2.3 配置位置
 

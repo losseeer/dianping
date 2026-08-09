@@ -254,6 +254,12 @@ dianping/
 │       ├── eval/                    # Agent 评测
 │       │   └── runner.py            # Benchmark / A-B 评测
 │       └── .env.example             # 环境变量示例
+├── sql/                              # 数据库脚本（按服务和用途分类）
+│   ├── backend/
+│   │   ├── schema/                   # 后端基础表与增量迁移
+│   │   └── data/                     # 后端测试数据
+│   ├── agent1/schema/                # Agent1 建表说明（当前无专属表）
+│   └── agent2/schema/                # Agent2 用户记忆、经验库、会话表
 └── docs/                            # 文档
     ├── SETUP.md                     # 中间件配置指南
     ├── agent-design.md              # Agent 设计方案
@@ -287,7 +293,11 @@ docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 \
   -e RABBITMQ_DEFAULT_USER=guest -e RABBITMQ_DEFAULT_PASS=guest rabbitmq:3-management
 
 # 2. 导入数据库
-mysql -h 127.0.0.1 -u root dingping < src/main/resources/db/hmdp.sql
+mysql -h 127.0.0.1 -u root dingping < sql/backend/schema/001_core.sql
+mysql -h 127.0.0.1 -u root dingping < sql/backend/schema/002_payment_and_search.sql
+mysql -h 127.0.0.1 -u root dingping < sql/agent2/schema/001_agent_tables.sql
+# 可选：导入后端测试数据
+mysql -h 127.0.0.1 -u root dingping < sql/backend/data/001_test_data.sql
 
 # 3. 启动 Java 后端
 export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-1.8.jdk/Contents/Home
