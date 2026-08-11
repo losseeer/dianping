@@ -16,7 +16,7 @@ from typing import Optional
 
 import aiomysql
 
-from config import config
+from core.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +50,7 @@ async def close_pool():
         _pool = None
 
 
-# ============================================================
-# preferences 表 CRUD（用户级长期记忆）
-# ============================================================
+# --- preferences 表 CRUD（用户级长期记忆） ---
 
 async def load_preferences(user_id: int) -> Optional[dict]:
     """从 MySQL 读取用户偏好"""
@@ -98,9 +96,7 @@ async def save_preferences(user_id: int, memory: dict) -> None:
     logger.debug(f"MySQL preferences saved for user {user_id}")
 
 
-# ============================================================
-# playbook 表 CRUD（Agent级长期记忆）
-# ============================================================
+# --- playbook 表 CRUD（Agent 级长期记忆） ---
 
 async def load_playbook_entries() -> list[dict]:
     """从 MySQL 读取所有 playbook 条目"""
@@ -167,9 +163,7 @@ async def delete_playbook_entry(entry_id: str) -> None:
             )
 
 
-# ============================================================
-# conversation 表 CRUD（会话级对话历史，MySQL持久化 + Redis缓存）
-# ============================================================
+# --- conversation 表 CRUD（MySQL 持久化 + Redis 缓存） ---
 
 async def append_conversation_turn(
     thread_id: str, user_id: int, turn_index: int, role: str, content: str

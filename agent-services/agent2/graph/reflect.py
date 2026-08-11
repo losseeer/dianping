@@ -1,13 +1,7 @@
 """
-Layer 1: Reflect — 推荐质量自评节点
-
-对应论文 Pattern 1 (Workflow Automation):
-  "模型通过 agent runtime 分析自身执行轨迹和失败案例，据此迭代改进"
-
-在 generate_recommendation 之后新增 reflect 节点：
-  1. LLM 自评推荐质量（候选匹配度、理由充分性、多样性）
-  2. 评分低于阈值 → 触发重规划（修改查询策略/放宽条件）
-  3. 记录反思结果到轨迹，供 Playbook Reflector 蒸馏经验
+Reflect 节点：推荐质量自评。
+LLM 自评推荐质量（匹配度/理由/多样性），评分低于阈值触发重规划，
+反思结果记录到轨迹供 Playbook Reflector 蒸馏经验。
 """
 
 import json
@@ -18,9 +12,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from typing import Literal
 
-from core.llm import get_llm
-from config import config
-from models import ReflectionResult
+from core.llm import get_llm, call_llm
+from core.config import config
+from graph.utils import _sv
+from core.models import ReflectionResult
 
 logger = logging.getLogger(__name__)
 
@@ -63,24 +58,20 @@ shouldReplan=true 当且仅当 score < {threshold} 且存在可通过重规划�
 
 async def reflect_node(state) -> dict:
     """
-    LangGraph 节点: 自评推荐质量。
-    
-    对应论文: "模型分析自身执行轨迹和失败案例，据此迭代改进"
-    通过 agent runtime（而非静态 prompt）进行自检。
+    LangGraph 节点：自评推荐质量。
+    通过 agent runtime（而非静态 prompt）进行自检，分析执行轨迹并迭代改进。
     """
-    from memory.user import load_memory
+    from memory.preferences import load_memory
     from memory.conversation import get_context_summary
 
-    llm = get_llm()
     start = time.time()
 
-    # 获取 state 字段
-    user_message = state.user_message if hasattr(state, "user_message") else state.get("user_message", "")
-    thread_id = state.thread_id if hasattr(state, "thread_id") else state.get("thread_id", "")
-    memory = state.memory if hasattr(state, "memory") else state.get("memory", {})
-    ranked_shops = state.ranked_shops if hasattr(state, "ranked_shops") else state.get("ranked_shops", [])
-    final_rec = state.final_recommendation if hasattr(state, "final_recommendation") else state.get("final_recommendation", "")
-    iteration_count = state.iteration_count if hasattr(state, "iteration_count") else state.get("iteration_count", 0)
+    user_message = _sv(state, "user_message", "")
+    thread_id = _sv(state, "thread_id", "")
+    memory = _sv(state, "memory", {})
+    ranked_shops = _sv(state, "ranked_shops", [])
+    final_rec = _sv(state, "final_recommendation", "")
+    iteration_count = _sv(state, "iteration_count", 0)
 
     memory_str = json.dumps(memory.get("preferences", {}), ensure_ascii=False) if memory else "{}"
     rec_str = json.dumps(ranked_shops[:5], ensure_ascii=False) if ranked_shops else final_rec[:500]
@@ -105,7 +96,7 @@ async def reflect_node(state) -> dict:
     )
 
     try:
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        response = await call_llm([HumanMessage(content=prompt)])
         import re
         text = response.content.strip()
         if text.startswith("```"):
@@ -128,7 +119,7 @@ async def reflect_node(state) -> dict:
         "reflection_weaknesses": result.weaknesses,
     }
 
-    # 如果评分低且未超过最大迭代次数，触发重规划
+    # 评分低且未超最大迭代次数时触发重规划
     if result.shouldReplan and iteration_count < config.AGENT2_MAX_ITERATIONS:
         updates["should_replan"] = True
         updates["replan_hints"] = result.replanHints

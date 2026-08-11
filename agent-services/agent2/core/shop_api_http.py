@@ -2,12 +2,12 @@ import httpx
 import logging
 from typing import Any, Optional
 
-from config import config
+from core.config import config
 
 logger = logging.getLogger(__name__)
 
 
-class JavaApiClient:
+class ShopApiHttp:
     """调用 Java 后端 REST API 获取业务数据"""
 
     def __init__(self, base_url: str = config.JAVA_API_BASE_URL):
@@ -38,8 +38,16 @@ class JavaApiClient:
     async def get_shop_detail(self, shop_id: int) -> dict:
         return await self._get(f"/shop/{shop_id}")
 
-    async def search_shops_by_name(self, keyword: str, page: int = 1) -> list:
-        data = await self._get("/shop/of/name", {"name": keyword, "current": page})
+    async def search_shops(self, keyword: str, page: int = 1, x: float = None, y: float = None) -> list:
+        """ES 全文搜索：multi_match 在 name/area/address/tags 四字段分词匹配。
+        后端 @CircuitBreaker 会在 ES 不可用时自动降级为 MySQL LIKE 多字段查询。
+        x/y 暂不传给后端（后端 ES 接口未支持坐标过滤），保留参数以对齐 ShopApiMysql 签名。"""
+        data = await self._get("/shop/search", {
+            "keyword": keyword, "current": page, "size": 20
+        })
+        # ES 接口返回 {list, total, took, current, size}，提取 list
+        if isinstance(data, dict):
+            return data.get("list", []) or []
         return data if isinstance(data, list) else []
 
     async def search_shops_nearby(
@@ -54,21 +62,10 @@ class JavaApiClient:
         data = await self._get("/shop-type/list")
         return data if isinstance(data, list) else []
 
-    # ---- 评价相关 ----
-
     async def get_shop_reviews(self, shop_id: int, current: int = 1) -> list:
+        """获取商铺评价列表（从 Java 后端 /blog/of/shop）"""
         data = await self._get("/blog/of/shop", {"shopId": shop_id, "current": current})
         return data if isinstance(data, list) else []
 
-    async def get_hot_reviews(self, current: int = 1) -> list:
-        data = await self._get("/blog/hot", {"current": current})
-        return data if isinstance(data, list) else []
 
-    # ---- 用户相关 ----
-
-    async def get_user_by_id(self, user_id: int) -> dict:
-        return await self._get(f"/user/{user_id}")
-
-
-# 全局实例
-java_api = JavaApiClient()
+shop_api = ShopApiHttp()

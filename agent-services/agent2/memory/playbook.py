@@ -1,22 +1,9 @@
 """
-Layer 2: Playbook Manager — ACE (Agentic Context Engineering) 实现
+Playbook Manager — ACE 经验上下文管理。
 
-将上下文视为 evolving playbook，而非不断增长的 prompt。
-
-三个核心组件（对应论文 ACE 框架）：
-  Generator  → Agent2 执行流程本身（已有）
-  Reflector  → reflect() 从轨迹蒸馏成功/失败洞察
-  Curator    → curate() 将洞察整理为结构化条目 (entryId, description)，增量合并
-
-RAG 检索（语义相关性过滤）：
-  创建/更新条目时 → embed(description) → 存入 Chroma 向量库
-  Plan 阶段 → embed(用户查询 + 会话摘要) → Chroma 语义检索 Top-K → 置信度加权 → 注入 prompt
-  降级策略：Embedding / Chroma 不可用时，回退到纯置信度排序
-
-存储架构:
-  MySQL: tb_agent_playbook（source of truth，断电不丢）
-  Redis: agent2:playbook → 条目 JSON 缓存
-  Chroma: ./chroma_data/ → 向量持久化（entryId → embedding）"""
+将上下文视为 evolving playbook：Reflector 蒸馏轨迹洞察，Curator 增量合并为结构化条目。
+存储：MySQL 持久化 + Redis 缓存 + Chroma 向量检索（语义相关性过滤，失败降级纯置信度排序）。
+"""
 
 import json
 import logging
@@ -25,17 +12,17 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from config import config
+from core.config import config
 from core.redis import get_redis
-from core.llm import get_llm
-from models import PlaybookEntry, TrajectoryRecord
-from core.mysql import load_playbook_entries, save_playbook_entry, delete_playbook_entry
+from core.llm import get_llm, call_llm
+from core.models import PlaybookEntry, TrajectoryRecord
+from core.mysql_store import load_playbook_entries, save_playbook_entry, delete_playbook_entry
 from langchain_core.messages import HumanMessage
 
 logger = logging.getLogger(__name__)
 
 # ---- Chroma / Embedding 配置 ----
-CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_data")
+CHROMA_PERSIST_DIR = config.CHROMA_PERSIST_DIR
 CHROMA_COLLECTION = "playbook_entries"
 # 使用 ChromaDB 内置 ONNX 模型，本地运行，无需 API（384维，首次自动下载 ~80MB）
 
@@ -97,7 +84,7 @@ class PlaybookManager:
         self._chroma_client = None
         self._collection = None
 
-    # ==== Chroma 客户端 ====
+    # --- Chroma 客户端 ---
 
     def _get_chroma_collection(self):
         """懒加载 Chroma 持久化集合"""
@@ -112,7 +99,7 @@ class PlaybookManager:
             )
         return self._collection
 
-    # ==== Embedding（ChromaDB ONNX 内置模型，本地运行零 API 调用）====
+    # --- Embedding（ChromaDB ONNX 内置模型，本地运行零 API 调用） ---
 
     def _get_embedding_client(self):
         """懒加载 ONNX embedding 函数（all-MiniLM-L6-v2，384维）"""
@@ -140,7 +127,7 @@ class PlaybookManager:
         results = await self._embed_texts([text])
         return results[0] if results else None
 
-    # ==== 向量索引（Chroma 持久化）====
+    # --- 向量索引（Chroma 持久化） ---
 
     async def _sync_vectors(self, entries: list[PlaybookEntry]) -> None:
         """增量同步向量到 Chroma：只 embed 新条目并 upsert"""
@@ -175,7 +162,6 @@ class PlaybookManager:
             return 0
 
         collection = self._get_chroma_collection()
-        # 清空重建
         import asyncio
         await asyncio.to_thread(collection.delete, where={})
 
@@ -198,7 +184,7 @@ class PlaybookManager:
         logger.info(f"Chroma index rebuilt: {len(valid_ids)} entries")
         return len(valid_ids)
 
-    # ==== 读取（read-through cache）====
+    # --- 读取（read-through cache） ---
 
     async def get_entries(self) -> list[PlaybookEntry]:
         """获取所有 playbook 条目：Redis 命中→返回 | miss→查 MySQL→回填 Redis"""
@@ -216,7 +202,7 @@ class PlaybookManager:
             logger.error(f"Playbook MySQL load failed: {e}")
             return []
 
-    # ==== RAG 检索 ====
+    # --- RAG 检索 ---
 
     async def get_context_rag(
         self,
@@ -224,25 +210,11 @@ class PlaybookManager:
         conversation_summary: str = "",
         top_k: int = 8,
     ) -> str:
-        """
-        RAG 检索：Chroma 语义匹配 + 置信度加权排序。
-
-        步骤:
-          1. 构造检索查询（用户消息 + 会话摘要）
-          2. Embed 查询 → Chroma 向量检索 Top-K×2 候选
-          3. 候选按相似度 × 置信度加权排序 → Top-K
-          4. 降级：embedding / Chroma 失败时回退到纯置信度排序
-
-        Args:
-            user_query: 用户当前消息
-            conversation_summary: 会话上下文摘要
-            top_k: 最终注入条目数
-        """
+        """RAG 检索：Chroma 语义匹配 + 置信度加权排序，失败时降级纯置信度排序。"""
         entries = await self.get_entries()
         if not entries:
             return "(暂无历史经验)"
 
-        # 1. 构造检索查询
         query_parts = [user_query]
         if conversation_summary and conversation_summary not in (
             "(新会话，无历史上下文)", "(暂无历史经验)"
@@ -250,10 +222,8 @@ class PlaybookManager:
             query_parts.append(conversation_summary[:200])
         query_text = " | ".join(query_parts)
 
-        # 2. Embed 查询向量
         query_vec = await self._embed_one(query_text)
 
-        # 3. Chroma 语义检索
         try:
             if query_vec is not None:
                 import asyncio
@@ -278,7 +248,7 @@ class PlaybookManager:
             retrieved_ids = set()
             distances = {}
 
-        # 4. 混合评分：Chroma 距离 → 相似度，结合置信度
+        # 混合评分：Chroma 距离 → 相似度，结合置信度
         if retrieved_ids:
             scored = []
             for e in entries:
@@ -298,14 +268,13 @@ class PlaybookManager:
             scored = [(e.confidence, 0.0, e) for e in entries]
             scored.sort(key=lambda x: x[0], reverse=True)
 
-        # 5. 取 Top-K
         selected = scored[:top_k]
         lines = []
         for combined_score, sim, e in selected:
             lines.append(f"- [{e.category}] {e.description}")
         return "\n".join(lines)
 
-    # ==== 原有 get_context（保持兼容）====
+    # --- 原有 get_context（保持兼容） ---
 
     async def get_context(
         self,
@@ -314,12 +283,7 @@ class PlaybookManager:
         conversation_summary: str = "",
         use_rag: bool = True,
     ) -> str:
-        """
-        返回注入到 system prompt 的上下文文本。
-
-        use_rag=True 且有查询文本 → Chroma 语义检索 Top-K
-        否则 → 纯置信度排序（降级策略）
-        """
+        """返回注入 system prompt 的上下文。use_rag=True 走 RAG 检索，否则纯置信度排序。"""
         if use_rag and user_query:
             return await self.get_context_rag(user_query, conversation_summary, top_k=max_entries)
 
@@ -338,11 +302,10 @@ class PlaybookManager:
             lines.append(f"- [{e.category}] {e.description}")
         return "\n".join(lines)
 
-    # ---- Reflector: 从轨迹蒸馏洞察 ----
+    # --- Reflector: 从轨迹蒸馏洞察 ---
 
     async def reflect(self, record: TrajectoryRecord) -> list[dict]:
         """ACE Reflector: 从单条轨迹蒸馏经验洞察"""
-        llm = get_llm()
         prompt = REFLECT_PROMPT.format(
             user_message=record.userMessage,
             recommendation=record.finalRecommendation[:500],
@@ -357,7 +320,7 @@ class PlaybookManager:
         )
 
         try:
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            response = await call_llm([HumanMessage(content=prompt)])
             import re
             text = response.content.strip()
             if text.startswith("```"):
@@ -370,21 +333,30 @@ class PlaybookManager:
             logger.error(f"Playbook reflection failed: {e}")
         return []
 
-    # ---- Curator: 合并到结构化条目 ----
+    # --- Curator: 合并到结构化条目 ---
 
     async def curate(self, insights: list[dict], source: str = "reflection") -> int:
-        """ACE Curator: 将洞察整理为结构化条目，增量合并到 playbook。返回新增条目数。"""
+        """ACE Curator: 将洞察增量合并为结构化条目，返回新增数。低 confidence 不入选避免污染经验库（阈值 PLAYBOOK_MIN_NOVELTY）。"""
         if not insights:
             return 0
+
+        from core.config import config
+        min_confidence = getattr(config, "PLAYBOOK_MIN_NOVELTY", 0.5)
 
         existing = await self.get_entries()
         existing_descs = {e.description.lower().strip() for e in existing}
         now = datetime.now().isoformat()
         added = 0
+        skipped_low_conf = 0
 
         for insight in insights:
             desc = insight.get("description", "").strip()
             if not desc:
+                continue
+
+            conf = insight.get("confidence", 0.5)
+            if conf < min_confidence:
+                skipped_low_conf += 1
                 continue
 
             if desc.lower().strip() in existing_descs:
@@ -399,7 +371,7 @@ class PlaybookManager:
                 category=insight.get("category", "context_gap"),
                 description=desc,
                 source=source,
-                confidence=insight.get("confidence", 0.5),
+                confidence=conf,
                 createdAt=now,
                 timesApplied=0,
                 timesHelpful=0,
@@ -407,6 +379,9 @@ class PlaybookManager:
             existing.append(entry)
             existing_descs.add(desc.lower().strip())
             added += 1
+
+        if skipped_low_conf:
+            logger.info(f"Playbook curate: skipped {skipped_low_conf} low-confidence insights (threshold={min_confidence})")
 
         # 限制 playbook 大小
         if len(existing) > self.max_entries:
@@ -416,7 +391,7 @@ class PlaybookManager:
         await self._save(existing)
         return added
 
-    # ---- 应用追踪 ----
+    # --- 应用追踪 ---
 
     async def record_application(self, entry_ids: list[str], helpful: bool) -> None:
         """记录 playbook 条目被应用及是否有效"""
@@ -430,7 +405,7 @@ class PlaybookManager:
                     e.confidence = min(1.0, e.timesHelpful / e.timesApplied)
         await self._save(entries)
 
-    # ---- 去重精炼 ----
+    # --- 去重精炼 ---
 
     async def deduplicate(self) -> int:
         """定期去重精炼，防止 context collapse。返回移除的条目数。"""
@@ -462,21 +437,187 @@ class PlaybookManager:
         await self._save(list(seen.values()))
         return removed
 
-    # ---- 内部方法 ----
+    # ---------- Stage 4 信号管线：映射经验写入 + 摘要增强 ----------
+
+    async def add_mapping_entries(self, mappings: list[dict], origin_trajectory_id: Optional[str] = None) -> int:
+        """
+        批量写入 fuzzy_mapping 经验（Stage 4 distill.playbook_distill 的产出）。
+        相同 trigger+normalized 视为重复：confidence 加权累加，timesApplied+1。
+        仅 trigger 相同 normalized 不同 → 各自保留（冲突条目用 timesApplied×confidence 打分竞争）。
+
+        :param mappings: [{trigger, normalized, confidence, evidence}]
+        :param origin_trajectory_id: 仅用于日志追踪
+        :return: 新增（非重复）条目数
+        """
+        from improve.distill import encode_mapping_description, parse_mapping_description
+
+        if not mappings:
+            return 0
+
+        existing = await self.get_entries()
+        # 先建立索引：trigger -> [(normalized, entry, desc_text_lower)]
+        index: dict[str, list[tuple[str, PlaybookEntry]]] = {}
+        for e in existing:
+            parsed = parse_mapping_description(e.description)
+            if parsed:
+                index.setdefault(parsed["trigger"], []).append((parsed["normalized"], e))
+
+        now = datetime.now().isoformat()
+        added = 0
+
+        for m in mappings:
+            trigger = (m.get("trigger") or "").strip()
+            normalized = (m.get("normalized") or "").strip()
+            if not trigger or not normalized:
+                continue
+            new_conf = float(m.get("confidence") or 0.5)
+            # clamp
+            if new_conf <= 0:
+                new_conf = 0.5
+            new_conf = min(new_conf, 0.95)
+
+            found = index.get(trigger) or []
+            match_e: Optional[PlaybookEntry] = None
+            for norm, e in found:
+                if norm == normalized:
+                    match_e = e
+                    break
+
+            if match_e is not None:
+                # 重复命中：加权更新 confidence，timesApplied+1
+                old_hits = match_e.timesApplied
+                new_hits = old_hits + 1
+                # 指数加权：旧占 old_hits / new_hits，新占 1 / new_hits
+                updated_conf = (match_e.confidence * old_hits + new_conf) / new_hits
+                match_e.confidence = min(1.0, updated_conf + 0.03)  # +3% 命中奖励
+                match_e.timesApplied = new_hits
+                continue
+
+            # 新条目
+            desc = encode_mapping_description(m)
+            entry = PlaybookEntry(
+                entryId=str(uuid.uuid4())[:12],
+                category="intent_parsing",
+                description=desc,
+                source="distill_signal",
+                confidence=new_conf,
+                createdAt=now,
+                timesApplied=1,
+                timesHelpful=0,
+            )
+            existing.append(entry)
+            index.setdefault(trigger, []).append((normalized, entry))
+            added += 1
+
+        # 限制 playbook 大小（超出就删低 confidence + 低命中的）
+        if len(existing) > self.max_entries:
+            existing.sort(
+                key=lambda e: e.confidence * (1 + e.timesApplied * 0.1),
+                reverse=True,
+            )
+            before = len(existing)
+            existing = existing[: self.max_entries]
+            logger.info(f"Playbook add_mapping_entries: truncated {before}->{len(existing)} (cap={self.max_entries})")
+
+        await self._save(existing)
+        if added:
+            logger.info(
+                f"Playbook: +{added} fuzzy mappings (triggers={[m.get('trigger') for m in mappings]})"
+                + (f" origin={origin_trajectory_id}" if origin_trajectory_id else "")
+            )
+        return added
+
+    async def augment_summary(self, text: str) -> tuple[str, list[dict]]:
+        """
+        用 fuzzy_mapping 经验补全会话/用户输入里的模糊词 → 规范化值。
+
+        :param text: 原摘要文本（通常是 get_context_summary + 用户 query 拼合）
+        :return: (augmented_text, applied_mappings)
+            - augmented_text：如果有命中则追加一行 [Playbook 规范化补全] 提示
+            - applied_mappings：[{trigger, normalized, confidence, entryId}]（用于 record_application）
+        """
+        from improve.distill import parse_mapping_description
+
+        if not text:
+            return text, []
+
+        entries = await self.get_entries()
+        if not entries:
+            return text, []
+
+        # 先收集所有 fuzzy_mapping 并按 trigger 分桶
+        by_trigger: dict[str, list[tuple[float, PlaybookEntry, dict]]] = {}
+        for e in entries:
+            parsed = parse_mapping_description(e.description)
+            if not parsed:
+                continue
+            score = e.confidence * (1.0 + 0.1 * e.timesApplied)
+            by_trigger.setdefault(parsed["trigger"], []).append((score, e, parsed))
+
+        if not by_trigger:
+            return text, []
+
+        # 按 trigger 文本长度降序匹配（避免短 trigger 抢前缀）
+        triggers_sorted = sorted(by_trigger.keys(), key=len, reverse=True)
+
+        applied: list[dict] = []
+        applied_entries: list[str] = []
+        for trigger in triggers_sorted:
+            if trigger in text:
+                bucket = by_trigger[trigger]
+                # 同 trigger 选 score 最高的 normalized
+                bucket.sort(key=lambda x: x[0], reverse=True)
+                top_score, top_entry, top_parsed = bucket[0]
+                applied.append({
+                    "trigger": top_parsed["trigger"],
+                    "normalized": top_parsed["normalized"],
+                    "confidence": top_entry.confidence,
+                    "score": round(top_score, 3),
+                    "entryId": top_entry.entryId,
+                })
+                applied_entries.append(top_entry.entryId)
+
+        if not applied:
+            return text, []
+
+        extras = "；".join([f'「{a["trigger"]}」→{a["normalized"]}（置信{a["confidence"]:.2f}）' for a in applied])
+        augmented = text.rstrip() + f"\n\n[Playbook 规范化补全] {extras}"
+
+        # 记录应用次数（helpful 未知，记 timesApplied 即可，之后可单独回填 timesHelpful）
+        if applied_entries:
+            try:
+                await self._mark_applied_only(applied_entries)
+            except Exception as e:
+                logger.warning(f"augment_summary record_application mark failed: {e}")
+
+        return augmented, applied
+
+    async def _mark_applied_only(self, entry_ids: list[str]) -> None:
+        """仅标记 timesApplied，不更新 confidence/helpful（augment 阶段 helpful 未知）"""
+        if not entry_ids:
+            return
+        entries = await self.get_entries()
+        changed = False
+        for e in entries:
+            if e.entryId in entry_ids:
+                e.timesApplied += 1
+                changed = True
+        if changed:
+            await self._save(entries)
+
+    # --- 内部方法 ---
 
     async def _save(self, entries: list[PlaybookEntry]) -> None:
         """双写: MySQL（持久化）+ Redis（更新缓存 + 更新向量索引）"""
-        # 1. 写 MySQL（逐条 UPSERT）
+        # 逐条 UPSERT 到 MySQL
         for e in entries:
             try:
                 await save_playbook_entry(e.model_dump())
             except Exception as ex:
                 logger.error(f"MySQL playbook save failed for entry {e.entryId}: {ex}")
 
-        # 2. 更新 Redis 缓存
         self._cache(entries)
 
-        # 3. 增量同步向量到 Chroma
         try:
             await self._sync_vectors(entries)
         except Exception as ex:

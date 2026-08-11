@@ -1,13 +1,6 @@
-"""
-Agent2: 商户推荐 Agent — Harness Engineering 增强版
+"""Agent2: 商户推荐 Agent — Harness Engineering 四层架构。
 
-四层 Harness 架构:
-  Layer 1 Workflow:  load_memory → plan → execute → evaluate → generate → reflect → log_trajectory
-  Layer 2 Context:   plan 节点注入 ACE playbook 上下文（演化式）
-  Layer 3 Observability: 每节点输入/输出/耗时/决策记录到 TrajectoryStore（分层访问）
-  Layer 4 Self-Improvement: /agent2/self-improve 端点执行 propose-evaluate-accept 循环
-
-参考: Lilian Weng《Harness Engineering for Self-Improvement》
+1. Workflow（ReAct 工作流）/ 2. Context（经验上下文）/ 3. Observability（可观测性）/ 4. Self-Improvement（自进化）。
 """
 
 import json
@@ -17,15 +10,17 @@ import uuid
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import config
-from core.redis import get_redis, save_hitl_state, load_hitl_state, delete_hitl_state
+from core.config import config
+from core.llm import LLMBusyError
+from graph.hitl import save_hitl_state, load_hitl_state, delete_hitl_state
 from core.guard import guard_user_message
-from core.java_api import java_api
-from memory.user import load_memory
+from core.llm import reset_token_usage, get_token_usage
+from core.shop_api_http import shop_api
+from memory.preferences import load_memory
 from memory.playbook import playbook
 from eval.runner import eval_runner
 from memory.trajectory import trajectory_store
-from models import ChatRequest, ResumeRequest
+from core.models import ChatRequest, ResumeRequest
 from graph.state import AgentState
 from graph.builder import compiled_graph
 from graph.nodes import update_memory_node
@@ -42,20 +37,27 @@ app.add_middleware(
 )
 
 
-# ============================================================
-# 核心 API（生产必需，不可删）
-# ============================================================
+def _save_interrupt_state(thread_id: str, state: AgentState) -> None:
+    """序列化 AgentState 并写入 HITL 中断状态，供 resume 接口恢复"""
+    save_hitl_state(thread_id, state.model_dump_json())
+
+
+# --- 核心 API（生产必需，不可删） ---
 
 @app.post("/agent2/chat")
 async def chat_endpoint(req: ChatRequest):
     """商户推荐对话入口"""
     try:
-        from memory.conversation import append_turn, save_last_shops
+        from memory.conversation import append_turn, save_last_shops, get_recommended_ids, add_recommended_ids
+
+        # 防御性校验：拒绝匿名 userId
+        if not req.userId or req.userId <= 0:
+            return {"type": "error", "error": "请先登录后再使用AI美食助手"}
 
         thread_id = req.threadId or str(uuid.uuid4())
 
         clean_msg = guard_user_message(req.message)
-        append_turn(thread_id, req.userId, "user", clean_msg)
+        await append_turn(thread_id, req.userId, "user", clean_msg)
 
         initial_state = AgentState(
             user_message=clean_msg,
@@ -63,10 +65,13 @@ async def chat_endpoint(req: ChatRequest):
             user_x=req.x,
             user_y=req.y,
             thread_id=thread_id,
+            recommended_shop_ids=get_recommended_ids(thread_id),
         )
 
+        reset_token_usage()
         result_state = await compiled_graph.ainvoke(initial_state.model_dump())
         state = AgentState(**result_state)
+        token_usage = get_token_usage()
 
         if state.hitl_needed:
             _save_interrupt_state(thread_id, state)
@@ -75,11 +80,16 @@ async def chat_endpoint(req: ChatRequest):
                 "question": state.hitl_question,
                 "options": state.hitl_options,
                 "threadId": thread_id,
+                "tokenUsage": token_usage,
             }
         else:
             assistant_msg = state.final_recommendation or json.dumps(state.ranked_shops[:3], ensure_ascii=False)
-            append_turn(thread_id, req.userId, "assistant", assistant_msg)
+            await append_turn(thread_id, req.userId, "assistant", assistant_msg)
             save_last_shops(thread_id, state.ranked_shops or [])
+            # 保存本轮推荐的商铺 ID，供下一轮去重
+            _new_ids = [s.get("id") or s.get("shopId") for s in (state.ranked_shops or []) if s.get("id") or s.get("shopId")]
+            if _new_ids:
+                add_recommended_ids(thread_id, _new_ids)
             return {
                 "type": "recommendation",
                 "shops": state.ranked_shops,
@@ -90,8 +100,12 @@ async def chat_endpoint(req: ChatRequest):
                 "reflectionScore": state.reflection_score,
                 "reflectionNotes": state.reflection_notes,
                 "trajectoryId": state.trajectory_id,
+                "tokenUsage": token_usage,
             }
 
+    except LLMBusyError as e:
+        logger.warning(f"Agent2 chat LLM busy: {e}")
+        return {"type": "busy", "message": "当前访问高峰，请稍后重试", "detail": str(e)}
     except Exception as e:
         logger.error(f"Agent2 chat failed: {e}", exc_info=True)
         return {"error": str(e), "type": "error"}
@@ -101,7 +115,11 @@ async def chat_endpoint(req: ChatRequest):
 async def resume_endpoint(req: ResumeRequest):
     """恢复中断的对话"""
     try:
-        from memory.conversation import append_turn, save_last_shops
+        from memory.conversation import append_turn, save_last_shops, get_recommended_ids, add_recommended_ids
+
+        # 防御性校验：拒绝匿名 userId
+        if not req.userId or req.userId <= 0:
+            return {"type": "error", "error": "请先登录后再使用AI美食助手"}
 
         thread_id = req.threadId
         raw = load_hitl_state(thread_id)
@@ -110,7 +128,7 @@ async def resume_endpoint(req: ResumeRequest):
         state = AgentState(**raw)
 
         clean_feedback = guard_user_message(req.response)
-        append_turn(thread_id, state.user_id, "user", clean_feedback)
+        await append_turn(thread_id, state.user_id, "user", clean_feedback)
 
         state.user_feedback = clean_feedback
         state.hitl_needed = False
@@ -124,10 +142,10 @@ async def resume_endpoint(req: ResumeRequest):
         for k, v in updated.items():
             state_dict[k] = v
 
-        delete_hitl_state(thread_id)
-
+        reset_token_usage()
         result_state = await compiled_graph.ainvoke(state_dict)
         state = AgentState(**result_state)
+        token_usage = get_token_usage()
 
         if state.hitl_needed:
             _save_interrupt_state(thread_id, state)
@@ -136,11 +154,17 @@ async def resume_endpoint(req: ResumeRequest):
                 "question": state.hitl_question,
                 "options": state.hitl_options,
                 "threadId": thread_id,
+                "tokenUsage": token_usage,
             }
         else:
+            delete_hitl_state(thread_id)
             assistant_msg = state.final_recommendation or json.dumps(state.ranked_shops[:3], ensure_ascii=False)
-            append_turn(thread_id, state.user_id, "assistant", assistant_msg)
+            await append_turn(thread_id, state.user_id, "assistant", assistant_msg)
             save_last_shops(thread_id, state.ranked_shops or [])
+            # 保存本轮推荐的商铺 ID，供下一轮去重
+            _new_ids = [s.get("id") or s.get("shopId") for s in (state.ranked_shops or []) if s.get("id") or s.get("shopId")]
+            if _new_ids:
+                add_recommended_ids(thread_id, _new_ids)
             return {
                 "type": "recommendation",
                 "shops": state.ranked_shops,
@@ -151,14 +175,18 @@ async def resume_endpoint(req: ResumeRequest):
                 "reflectionScore": state.reflection_score,
                 "reflectionNotes": state.reflection_notes,
                 "trajectoryId": state.trajectory_id,
+                "tokenUsage": token_usage,
             }
 
+    except LLMBusyError as e:
+        logger.warning(f"Agent2 resume LLM busy: {e}")
+        return {"type": "busy", "message": "当前访问高峰，请稍后重试", "detail": str(e)}
     except Exception as e:
         logger.error(f"Agent2 resume failed: {e}", exc_info=True)
         return {"error": str(e), "type": "error"}
 
 
-# ---- Layer 3: Trajectory & Observability API ----
+# ---- 可观测性 API ----
 # [DEV ONLY] 开发调试用，生产环境可删除。替代方案: test_e2e.py 直接调 trajectory_store
 
 @app.get("/agent2/trajectory/{trajectory_id}")
@@ -184,11 +212,38 @@ async def get_insights():
 
 @app.post("/agent2/trajectory/{trajectory_id}/outcome")
 async def update_trajectory_outcome(trajectory_id: str, outcome: str, feedback: str = ""):
+    """
+    更新轨迹 outcome（显式信号：accepted/rejected）并重新触发一次蒸馏入队。
+
+    【闭环说明 · 断口 3 修复】
+    轨迹落盘时 outcome 默认是 "unknown"，信号管线走「隐式信号」判定。
+    如果用户/前端在交互后调用本接口（如「用户点击查看某家详情 → accepted；用户说推荐不行 → rejected」），
+    需要：
+      1. 写入 outcome → trajectory_store 更新 record
+      2. 清除 processed marker（否则 signals.pop_pending_batch 会认为它已处理，永远不重新走信号判定）
+      3. 重新入队 PENDING_ZSET + 触发 piggyback kick → 立即按显式信号重新蒸馏 → Playbook/偏好更新
+
+    这样显式反馈才能闭环：用户反馈 → outcome 变更 → 信号重判 → 学到经验 → 下次推理通过 Playbook augment + memory 生效。
+    """
     trajectory_store.update_outcome(trajectory_id, outcome, feedback)
-    return {"status": "updated", "trajectoryId": trajectory_id, "outcome": outcome}
+
+    # Stage4 重判入队
+    try:
+        from improve.signals import mark_processed, is_processed, PROCESSED_PREFIX, enqueue_for_distill
+        from core.redis import get_redis
+        r = get_redis()
+        # 先清理 processed marker（无论 key 存在与否都安全），这样下次出队时不会被判「已处理」直接跳过
+        r.delete(f"{PROCESSED_PREFIX}{trajectory_id}")
+        # 重新入队（默认会触发 piggyback fire-and-forget，近实时地跑一次蒸馏）
+        enqueue_for_distill(trajectory_id, schedule_piggyback=True)
+        logger.info(f"[Stage4] outcome={outcome} re-enqueued trajectory={trajectory_id} for distill re-eval")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[Stage4] re-enqueue distill after outcome update failed silently: {e}")
+
+    return {"status": "updated", "trajectoryId": trajectory_id, "outcome": outcome, "reEnqueuedForDistill": True}
 
 
-# ---- Layer 2: Playbook API ----
+# ---- Playbook 经验库 API ----
 # [DEV ONLY] 开发调试用，生产环境可删除。替代方案: eval/runner.py 或 Python REPL 直接调 playbook 对象
 
 @app.get("/agent2/playbook")
@@ -211,16 +266,6 @@ async def deduplicate_playbook():
 async def rebuild_playbook_index():
     count = await playbook.rebuild_index()
     return {"status": "ok", "indexedEntries": count}
-
-
-# ---- Layer 4: Self-Improvement API ----
-# [UNUSED] 手动触发，未集成到 graph 工作流。真实自进化由 playbook.reflect+curate 自动运行
-
-@app.post("/agent2/self-improve")
-async def self_improve():
-    from improve.self_improve import self_improvement_engine
-    report = await self_improvement_engine.run()
-    return report.model_dump()
 
 
 # ---- Eval API ----
@@ -270,10 +315,21 @@ async def health():
     return {"status": "ok", "service": "agent2-shop-recommendation", "version": "2.0.0"}
 
 
+@app.on_event("startup")
+async def startup():
+    """启动时：拉起自进化蒸馏 daemon（兜底后台任务，每 5 分钟补跑一批轨迹蒸馏）"""
+    from improve.signals import start_distill_daemon
+    start_distill_daemon(app)
+
+
 @app.on_event("shutdown")
 async def shutdown():
-    await java_api.close()
-    from core.mysql import close_pool
+    from improve.signals import cancel_distill_daemon
+    cancel_distill_daemon(app)
+    await shop_api.close()
+    from core.agent1_client import agent1_client
+    await agent1_client.close()
+    from core.mysql_store import close_pool
     await close_pool()
 
 

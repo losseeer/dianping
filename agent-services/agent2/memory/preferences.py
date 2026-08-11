@@ -1,20 +1,16 @@
 """
-用户偏好记忆 — MySQL 持久化 + Redis 缓存（read-through cache）
+用户偏好记忆 — MySQL 持久化 + Redis read-through 缓存。
 
-读取: Redis 命中 → 返回 | Redis miss → 查 MySQL → 回填 Redis → 返回
-写入: MySQL（source of truth）→ Redis（更新缓存）
-
-Redis key: user:{userId}:preferences  TTL: 90天（缓存层，过期后回查 MySQL）
-MySQL table: tb_agent_preferences（持久化，断电不丢）
+读取 Redis 命中→返回 | miss→查 MySQL→回填；写入 MySQL→更新 Redis。
 """
 
 import json
 import logging
 from datetime import datetime
 
-from config import config
+from core.config import config
 from core.redis import get_redis
-from core.mysql import load_preferences, save_preferences
+from core.mysql_store import load_preferences, save_preferences
 
 logger = logging.getLogger(__name__)
 
@@ -26,21 +22,19 @@ async def load_memory(user_id: int) -> dict:
     r = get_redis()
     key = f"{config.MEMORY_KEY_PREFIX}{user_id}:preferences"
 
-    # 1. 先查 Redis 缓存
     raw = r.get(key)
     if raw:
         return json.loads(raw)
 
-    # 2. Redis miss → 查 MySQL
+    # Redis miss → 查 MySQL
     mysql_data = await load_preferences(user_id)
     if mysql_data:
-        # 3. 回填 Redis 缓存
         r.set(key, json.dumps(mysql_data, ensure_ascii=False),
               ex=config.MEMORY_EXPIRY_DAYS * 24 * 3600)
         logger.debug(f"Redis cache miss, loaded from MySQL for user {user_id}")
         return mysql_data
 
-    # 4. MySQL 也没有 → 返回默认空记忆
+    # MySQL 也没有 → 返回默认空记忆
     return _default_memory(user_id)
 
 
@@ -62,7 +56,6 @@ async def save_memory(user_id: int, memory: dict) -> None:
         logger.error(f"MySQL save failed for user {user_id}: {e}")
         # MySQL 写失败不阻塞流程，Redis 仍然更新（降级策略）
 
-    # 3. 更新 Redis 缓存
     r = get_redis()
     key = f"{config.MEMORY_KEY_PREFIX}{user_id}:preferences"
     r.set(key, json.dumps(merged, ensure_ascii=False),

@@ -1,9 +1,9 @@
 """
 Prompt Injection Guard — 三层防御 + Token 预算控制
 
-Layer 1: 输入清洗（预处理）— 剥离常见注入模式
-Layer 2: Prompt 加固（结构化）— XML 分隔用户内容与系统指令
-Layer 3: 输出校验（后处理）— JSON 结构验证 + 工具调用白名单
+1. 输入清洗（预处理）— 剥离常见注入模式
+2. Prompt 加固（结构化）— XML 分隔用户内容与系统指令
+3. 输出校验（后处理）— JSON 结构验证 + 工具调用白名单
 
 Token Budget: 每请求预算控制，防止成本爆炸（参数见 config.py）
 """
@@ -12,7 +12,7 @@ import re
 import logging
 from typing import Optional
 
-from config import config
+from core.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -77,18 +77,15 @@ def limit_candidates_for_prompt(
     max_count: int = None,
     budget: Optional[TokenBudget] = None,
 ) -> list[dict]:
-    """限制注入 prompt 的候选数量，超出时按评分取 Top-N"""
+    """限制注入 prompt 的候选数量，超出时按 评分50%+距离50% 综合排序取 Top-N"""
     if max_count is None:
         max_count = config.TOKEN_MAX_CANDIDATES_IN_PROMPT
     if len(candidates) <= max_count:
         return candidates
 
+    from graph.utils import rank_shops
     logger.info(f"Truncating candidates: {len(candidates)} → {max_count}")
-    sorted_candidates = sorted(
-        candidates,
-        key=lambda c: c.get("score", 0) or 0,
-        reverse=True,
-    )
+    sorted_candidates = rank_shops(candidates)
     return sorted_candidates[:max_count]
 
 # ---- 检测模式 ----
@@ -111,19 +108,10 @@ INJECTION_PATTERNS = [
     r"(\}\s*,\s*\{.*\})",  # 尝试注入额外 JSON 对象
 ]
 
-# ---- Layer 1: 输入清洗 ----
+# ---- 1. 输入清洗 ----
 
 def sanitize_user_input(text: str, max_length: int = 500) -> str:
-    """
-    清洗用户输入，去除恶意模式。
-
-    Args:
-        text: 原始用户输入
-        max_length: 最大保留长度
-
-    Returns:
-        清洗后的输入文本
-    """
+    """清洗用户输入，剥离已知注入模式与控制字符。"""
     if not text:
         return ""
 
@@ -151,15 +139,10 @@ def sanitize_user_input(text: str, max_length: int = 500) -> str:
     return text.strip()
 
 
-# ---- Layer 2: Prompt 加固 ----
+# ---- 2. Prompt 加固 ----
 
 def wrap_user_content(content: str, label: str = "USER_INPUT") -> str:
-    """
-    用 XML 标签包裹用户内容，与系统指令明确分隔。
-
-    用法:
-        prompt = f"系统指令...\n{wrap_user_content(user_msg)}"
-    """
+    """用 XML 标签包裹用户内容，与系统指令明确分隔。"""
     return f"<{label}>\n{content}\n</{label}>"
 
 
@@ -181,7 +164,7 @@ def harden_system_prompt(base_prompt: str) -> str:
     return base_prompt + guard_instructions
 
 
-# ---- Layer 3: 输出校验 ----
+# ---- 3. 输出校验 ----
 
 ALLOWED_TOOLS = {
     "search_shops_by_keyword",
@@ -189,17 +172,12 @@ ALLOWED_TOOLS = {
     "get_shop_detail",
     "get_shop_types",
     "get_review_summary",
-    "get_user_memory",
+    "get_shop_reviews",
 }
 
 
 def validate_tool_calls(tool_calls: list[dict]) -> tuple[list[dict], list[str]]:
-    """
-    校验工具调用白名单。
-
-    Returns:
-        (valid_calls, rejected_names)
-    """
+    """校验工具调用白名单，返回 (valid_calls, rejected_names)。"""
     valid = []
     rejected = []
     for tc in (tool_calls or []):
@@ -232,6 +210,6 @@ def is_valid_json_structure(parsed: dict, required_fields: list[str]) -> bool:
 # ---- 便捷函数：完整防护 ----
 
 def guard_user_message(text: str) -> str:
-    """对用户消息做完整防护（Layer 1 + Layer 2）"""
+    """对用户消息做完整防护（输入清洗 + Prompt 加固）"""
     cleaned = sanitize_user_input(text)
     return wrap_user_content(cleaned)

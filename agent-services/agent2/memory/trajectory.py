@@ -1,16 +1,8 @@
 """
-Layer 3: Trajectory Store — AHE 三大可观测性支柱的实现
+Trajectory Store — 可观测性三层结构。
 
-分层访问结构（对应 AHE Experience Observability）：
-  Layer 1: 原始轨迹（完整 JSON，按需读取）
-  Layer 2: 分析报告（每条轨迹的成功/失败原因摘要）
-  Layer 3: 聚合洞察（跨轨迹统计 + 失败模式聚类）
-
-Redis 存储结构：
-  agent2:trajectory:{trajectoryId}    → 完整 TrajectoryRecord JSON
-  agent2:trajectory:user:{userId}     → ZSet (score=timestamp, member=trajectoryId)
-  agent2:trajectory:analysis:{trajId} → 分析报告 JSON
-  agent2:trajectory:insights          → List of TrajectoryInsight JSON
+1. 原始轨迹 CRUD / 2. 分析报告（规则驱动）/ 3. 聚合洞察（跨轨迹统计）。
+存储于 Redis，按 trajectoryId、userId ZSet、analysis、insights 分键。
 """
 
 import json
@@ -19,9 +11,9 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from config import config
+from core.config import config
 from core.redis import get_redis
-from models import TrajectoryRecord, TrajectoryNodeLog, TrajectoryInsight
+from core.models import TrajectoryRecord, TrajectoryNodeLog, TrajectoryInsight
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +25,7 @@ class TrajectoryStore:
         self.prefix = config.TRAJECTORY_KEY_PREFIX
         self.expiry = config.TRAJECTORY_EXPIRY_DAYS
 
-    # ---- Layer 1: 原始轨迹 CRUD ----
+    # --- 1. 原始轨迹 CRUD ---
 
     def save(self, record: TrajectoryRecord) -> str:
         """保存完整轨迹到 Redis"""
@@ -96,7 +88,7 @@ class TrajectoryStore:
         records.sort(key=lambda x: x.createdAt, reverse=True)
         return records[:limit]
 
-    # ---- Layer 2: 分析报告 ----
+    # --- 2. 分析报告 ---
 
     def save_analysis(self, trajectory_id: str, analysis: dict) -> None:
         """保存单条轨迹的分析报告"""
@@ -113,10 +105,7 @@ class TrajectoryStore:
         return None
 
     def analyze_trajectory(self, record: TrajectoryRecord) -> dict:
-        """
-        生成单条轨迹的分析报告（无需 LLM，规则驱动）。
-        对应 AHE Experience Observability 的第二层。
-        """
+        """生成单条轨迹的分析报告（规则驱动，无需 LLM）。"""
         analysis = {
             "trajectoryId": record.trajectoryId,
             "userId": record.userId,
@@ -133,7 +122,6 @@ class TrajectoryStore:
             "nodeTimings": {},
         }
 
-        # 节点耗时统计
         for log in record.nodeLogs:
             analysis["nodeTimings"][log.nodeName] = log.durationMs
 
@@ -154,7 +142,7 @@ class TrajectoryStore:
         self.save_analysis(record.trajectoryId, analysis)
         return analysis
 
-    # ---- Layer 3: 聚合洞察 ----
+    # --- 3. 聚合洞察 ---
 
     def get_insights(self) -> list[TrajectoryInsight]:
         """获取聚合洞察列表"""
@@ -166,10 +154,7 @@ class TrajectoryStore:
         return []
 
     def compute_insights(self, trajectories: list[TrajectoryRecord]) -> list[TrajectoryInsight]:
-        """
-        从一批轨迹中计算聚合洞察。
-        对应 AHE Experience Observability 的第三层。
-        """
+        """从一批轨迹中计算聚合洞察。"""
         if not trajectories:
             return []
 
@@ -240,7 +225,6 @@ class TrajectoryStore:
                 createdAt=now,
             ))
 
-        # 持久化
         r = get_redis()
         r.set(
             f"{self.prefix}insights",
@@ -250,7 +234,7 @@ class TrajectoryStore:
 
         return insights
 
-    # ---- 辅助方法 ----
+    # --- 辅助方法 ---
 
     def update_outcome(self, trajectory_id: str, outcome: str, feedback: str = "") -> None:
         """更新轨迹的结果标注（用户接受/修改/拒绝）"""

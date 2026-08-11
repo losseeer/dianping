@@ -6,6 +6,7 @@ venv/
 
 # ChromaDB 向量数据
 chroma_data/
+data/
 
 # 测试与工具缓存
 .pytest_cache/

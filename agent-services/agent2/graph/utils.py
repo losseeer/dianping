@@ -1,4 +1,4 @@
-"""Graph utilities: timing, state helpers, JSON parsing"""
+"""Graph 工具：计时、state 辅助、JSON 解析"""
 import json
 import time
 
@@ -92,5 +92,44 @@ def _parse_llm_json(text: str) -> dict:
             except json.JSONDecodeError:
                 pass
         return {}
+
+
+def normalize_score(score) -> float:
+    """将后端评分（0-10）归一化到 0-5，兼容已归一化的值"""
+    if score is None:
+        return 0
+    return score / 10.0 if score > 5 else score
+
+
+def rank_shops(shops: list[dict], score_weight: float = 0.5, distance_weight: float = 0.5) -> list[dict]:
+    """
+    综合排序：评分 + 距离加权（默认各 50%）。
+
+    归一化：
+      score_norm   = score / 5.0                    （0-5 → 0-1，越高越好）
+      distance_norm = 1 - dist / max_dist           （越近越好，clamp [0,1]）
+
+    当 distance 全为 0（无坐标信息）时退化为纯评分排序。
+    """
+    if not shops:
+        return shops
+
+    # 取本批次最大距离作为归一化分母
+    distances = [float(s.get("distance") or 0) for s in shops]
+    max_dist = max(distances) if distances else 0.0
+
+    def _rank_key(s: dict) -> float:
+        score = float(s.get("score") or 0)
+        score_norm = min(score / 5.0, 1.0) if score > 0 else 0.0
+
+        dist = float(s.get("distance") or 0)
+        if max_dist > 0:
+            distance_norm = max(0.0, 1.0 - dist / max_dist)
+        else:
+            distance_norm = 0.0  # 无距离信息时不影响评分排序
+
+        return score_weight * score_norm + distance_weight * distance_norm
+
+    return sorted(shops, key=_rank_key, reverse=True)
 
 

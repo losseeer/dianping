@@ -1,78 +1,90 @@
-"""LangGraph nodes"""
+"""LangGraph 节点定义"""
+import asyncio
 import json
 import logging
 import uuid
 import time
 from langchain_core.messages import HumanMessage, SystemMessage
-from config import config
-from core.llm import get_llm
+from core.config import config
+from core.llm import get_llm, call_llm
 from core.guard import guard_user_message, validate_tool_calls, truncate_review_summary, limit_candidates_for_prompt
-from core.java_api import java_api
+from core.shop_api_http import shop_api
+from core.agent1_client import agent1_client
 from core.redis import get_redis
-from memory.user import load_memory, save_memory
+from memory.preferences import load_memory, save_memory
 from memory.playbook import playbook
-from improve.reflect import reflect_node
 from memory.trajectory import trajectory_store
-from graph.utils import _sv, timed_node, _parse_llm_json
-from graph.prompts import PLAN_SYSTEM_PROMPT, EVALUATE_SYSTEM_PROMPT, GENERATE_SYSTEM_PROMPT, MEMORY_UPDATE_PROMPT
+from graph.utils import _sv, timed_node, _parse_llm_json, normalize_score, rank_shops
+from graph.prompts import PLAN_SYSTEM_PROMPT, GENERATE_SYSTEM_PROMPT, MEMORY_UPDATE_PROMPT
 from graph.state import AgentState
-from models import TrajectoryRecord, TrajectoryNodeLog
+from core.models import TrajectoryRecord, TrajectoryNodeLog
 
 logger = logging.getLogger(__name__)
 
-async def execute_tool(tool_name: str, params: dict) -> dict:
-    """路由工具名到实际实现"""
+async def execute_tool(tool_name: str, params: dict, state: AgentState = None) -> dict:
+    """路由工具名到实际实现。
+
+    state 参数用于获取 recommended_shop_ids 以过滤已推荐商铺（可选，测试时可不传）。
+    """
     try:
         if tool_name == "search_shops_by_keyword":
             keyword = params.get("keyword", "")
-            shops = await java_api.search_shops_by_name(keyword)
+            x = params.get("x") or params.get("user_x")
+            y = params.get("y") or params.get("user_y")
+            shops = await shop_api.search_shops(keyword, x=x, y=y)
+            # 与 search_shops_nearby 一致的 client-side 后处理
+            max_price = params.get("maxPrice")
+            min_score = params.get("minScore")
+            if max_price:
+                shops = [s for s in shops if s.get("avgPrice", 999) <= max_price]
+            if min_score:
+                shops = [s for s in shops if normalize_score(s.get("score")) >= min_score]
             for s in shops:
-                if s.get("score") and s["score"] > 5:
-                    s["score"] = s["score"] / 10.0
+                s["score"] = normalize_score(s.get("score"))
+            shops = rank_shops(shops)
+            # 过滤已推荐商铺
+            if state:
+                shops = _filter_recommended(shops, state)
             return {"shops": shops, "count": len(shops)}
 
         elif tool_name == "search_shops_nearby":
             type_id = params.get("typeId")
             x = params.get("x") or params.get("user_x")
             y = params.get("y") or params.get("user_y")
-            shops = await java_api.search_shops_nearby(type_id, x, y)
+            shops = await shop_api.search_shops_nearby(type_id, x, y)
             max_price = params.get("maxPrice")
             min_score = params.get("minScore")
             if max_price:
                 shops = [s for s in shops if s.get("avgPrice", 999) <= max_price]
             if min_score:
-                shops = [s for s in shops if s.get("score", 0) / 10.0 >= min_score]
+                shops = [s for s in shops if normalize_score(s.get("score")) >= min_score]
             for s in shops:
-                if s.get("score") and s["score"] > 5:
-                    s["score"] = s["score"] / 10.0
+                s["score"] = normalize_score(s.get("score"))
+            shops = rank_shops(shops)
+            # 过滤已推荐商铺
+            if state:
+                shops = _filter_recommended(shops, state)
             return {"shops": shops, "count": len(shops)}
 
         elif tool_name == "get_shop_detail":
             shop_id = params.get("shopId")
-            shop = await java_api.get_shop_detail(shop_id)
-            if shop.get("score") and shop["score"] > 5:
-                shop["score"] = shop["score"] / 10.0
+            shop = await shop_api.get_shop_detail(shop_id)
+            shop["score"] = normalize_score(shop.get("score"))
             return {"shop": shop}
 
         elif tool_name == "get_shop_types":
-            types = await java_api.get_shop_types()
+            types = await shop_api.get_shop_types()
             return {"types": types}
 
         elif tool_name == "get_review_summary":
             shop_id = params.get("shopId")
-            import httpx
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"http://localhost:{config.AGENT1_PORT}/agent1/summary",
-                    json={"shopId": shop_id},
-                    timeout=60.0,
-                )
-                return resp.json()
+            return await agent1_client.get_review_summary(shop_id)
 
-        elif tool_name == "get_user_memory":
-            user_id = params.get("userId")
-            mem = await load_memory(user_id)
-            return {"memory": mem}
+        elif tool_name == "get_shop_reviews":
+            shop_id = params.get("shopId")
+            current = params.get("current", 1)
+            reviews = await shop_api.get_shop_reviews(shop_id, current)
+            return {"reviews": reviews, "count": len(reviews) if isinstance(reviews, list) else 0}
 
         else:
             return {"error": f"Unknown tool: {tool_name}"}
@@ -82,9 +94,18 @@ async def execute_tool(tool_name: str, params: dict) -> dict:
         return {"error": str(e)}
 
 
-# ============================================================
-# LangGraph 节点
-# ============================================================
+def _filter_recommended(shops: list[dict], state: AgentState) -> list[dict]:
+    """过滤掉本轮会话已推荐过的商铺（基于 recommended_shop_ids）。"""
+    recommended_ids = set(getattr(state, "recommended_shop_ids", []) or [])
+    if not recommended_ids:
+        return shops
+    filtered = [s for s in shops if (s.get("id") or s.get("shopId")) not in recommended_ids]
+    if len(filtered) < len(shops):
+        logger.info(f"Filtered {len(shops) - len(filtered)} already-recommended shops")
+    return filtered
+
+
+# --- LangGraph 节点 ---
 
 @timed_node("load_memory")
 async def load_memory_node(state: AgentState) -> dict:
@@ -99,11 +120,9 @@ async def load_memory_node(state: AgentState) -> dict:
 @timed_node("plan")
 async def plan_node(state: AgentState) -> dict:
     """
-    LLM 推理——分析意图、决定调用哪些工具。
+    LLM 推理：分析意图、决定调用哪些工具。
     注入三段上下文：会话级摘要（短期）+ 用户偏好（长期 per-user）+ Agent经验（长期 global）
     """
-    llm = get_llm()
-
     memory_str = json.dumps(state.memory.get("preferences", {}), ensure_ascii=False)
 
     # 会话级短期记忆：多轮对话上下文摘要（截断防止 token 爆炸）
@@ -118,10 +137,26 @@ async def plan_node(state: AgentState) -> dict:
             conversation_summary = conversation_summary[:max_chars] + "\n...(上下文已截断)"
         last_shops_text = get_last_shops(thread_id) or "(无上轮推荐)"
 
-    # RAG 检索：语义匹配 Playbook 条目
+    # ---------- Stage 4 Playbook 增强：把模糊词 → 规范化补全 注入上下文 ----------
+    user_msg = _sv(state, "user_message", "")
+    try:
+        augment_input = conversation_summary + "\n用户本轮消息：" + user_msg
+        augmented_text, applied = await playbook.augment_summary(augment_input)
+        if augmented_text != augment_input:
+            # 将 Playbook 补全作为 conversation_summary 的一部分附加
+            conversation_summary = augmented_text
+            if applied:
+                logger.info(
+                    f"Playbook augment_summary: applied {len(applied)} mapping(s): "
+                    + ", ".join([f'{a["trigger"]}→{a["normalized"]}' for a in applied])
+                )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Playbook augment_summary failed silently: {e}")
+
+    # RAG 检索 Playbook 条目（语义匹配）
     playbook_context = await playbook.get_context(
         max_entries=8,
-        user_query=_sv(state, "user_message", ""),
+        user_query=user_msg,
         conversation_summary=conversation_summary,
     )
 
@@ -133,6 +168,9 @@ async def plan_node(state: AgentState) -> dict:
     )
 
     context_msg = f"用户消息：{guard_user_message(state.user_message)}"
+    # 显式告知 LLM 用户坐标已就绪，避免误判"未提供位置"而触发不必要的 HITL
+    if state.user_x and state.user_y:
+        context_msg += f"\n用户当前坐标：x={state.user_x}, y={state.user_y}（已自动注入到 nearby 类工具，无需询问用户）"
     if state.tool_results:
         context_msg += f"\n\n已有的工具执行结果：\n{json.dumps(state.tool_results[-5:], ensure_ascii=False)}"
     if state.candidate_shops:
@@ -140,24 +178,26 @@ async def plan_node(state: AgentState) -> dict:
     if state.replan_hints:
         context_msg += f"\n\n重规划提示：{json.dumps(state.replan_hints, ensure_ascii=False)}"
 
-    response = await llm.ainvoke([
+    response = await call_llm([
         SystemMessage(content=prompt),
         HumanMessage(content=context_msg),
     ])
 
     parsed = _parse_llm_json(response.content)
 
-    # Layer 1: 工具调用白名单校验
+    # 工具调用白名单校验
     raw_tool_calls = [tc for tc in (parsed.get("tool_calls") or []) if isinstance(tc, dict)]
     valid_tool_calls, rejected = validate_tool_calls(raw_tool_calls)
 
-    # Layer 3: Decision logging
+    # 决策日志
+    ia = parsed.get("intent_analysis") or {}
     decision = {
         "node": "plan",
         "decision": "tool_calls" if parsed.get("tool_calls") else "hitl" if parsed.get("hitl_needed") else "unknown",
         "reasoning": parsed.get("reasoning", "")[:200],
         "prediction": f"Expected {len(parsed.get('tool_calls', []))} tool calls, HITL={parsed.get('hitl_needed', False)}",
         "verified": None,
+        "intent_analysis": ia if isinstance(ia, dict) else {},
     }
 
     return {
@@ -187,7 +227,7 @@ async def execute_node(state: AgentState) -> dict:
         if state.user_y and "y" not in params:
             params["user_y"] = state.user_y
 
-        result = await execute_tool(tool_name, params)
+        result = await execute_tool(tool_name, params, state)
         results.append({"tool": tool_name, "params": params, "result": result})
 
         if "shops" in result:
@@ -203,71 +243,236 @@ async def execute_node(state: AgentState) -> dict:
 
 @timed_node("evaluate")
 async def evaluate_node(state: AgentState) -> dict:
-    """LLM 评估当前数据是否足够"""
-    llm = get_llm()
+    """
+    【重构 2026-08】纯规则判定候选是否充足，零 LLM 调用。
 
-    summary_parts = []
-    for tr in state.tool_results[-5:]:
-        tool = tr.get("tool")
-        result = tr.get("result", {})
-        if "shops" in result:
-            summary_parts.append(f"{tool}: 找到 {result.get('count', 0)} 家商铺")
-        elif "shop" in result:
-            summary_parts.append(f"{tool}: {result['shop'].get('name', '未知')}")
-        elif "types" in result:
-            summary_parts.append(f"{tool}: 获取了类型列表")
-        elif "memory" in result:
-            summary_parts.append(f"{tool}: 获取了用户记忆")
-        else:
-            summary_parts.append(f"{tool}: {json.dumps(result, ensure_ascii=False)[:100]}")
-
-    tool_results_summary = "\n".join(summary_parts)
-    memory_str = json.dumps(state.memory.get("preferences", {}), ensure_ascii=False)
-
-    prompt = EVALUATE_SYSTEM_PROMPT.format(
-        tool_results_summary=tool_results_summary,
-        candidate_count=len(state.candidate_shops),
-        memory=memory_str,
+    判定优先级：
+      1. 已经 HITL 过 (hitl_count ≥ 1) → 强制 sufficient，不再打断用户（单轮最多一次 HITL 保证）
+      2. 候选数 ≥ AGENT2_MIN_CANDIDATES 且执行过搜索 → sufficient
+      3. 候选数 = 0 且 hitl_count = 0 → hitl_needed（问用户补充条件）
+      4. 0 < 候选 < AGENT2_MIN_CANDIDATES 且 replan_count = 0 → insufficient（交给 Replan 放宽）
+      5. 0 < 候选 < AGENT2_MIN_CANDIDATES 且 replan_count ≥ 1 → sufficient（放宽过仍少，硬推荐）
+    """
+    has_searched = any(
+        tr.get("tool") in ("search_shops_by_keyword", "search_shops_nearby")
+        for tr in state.tool_results
     )
+    candidate_count = len(state.candidate_shops)
+    min_candidates = config.AGENT2_MIN_CANDIDATES
+    replan_count = getattr(state, "replan_count", 0) or 0
+    hitl_count = getattr(state, "hitl_count", 0) or 0
 
-    response = await llm.ainvoke([HumanMessage(content=prompt)])
-    parsed = _parse_llm_json(response.content)
+    evaluation = "insufficient"
+    reasoning = ""
+    hitl_question = ""
+    hitl_options: list[str] = []
+    hitl_reason = ""
+    next_tool_calls: list[dict] = []
+    hitl_needed_flag = False
 
-    evaluation = parsed.get("evaluation", "insufficient")
+    # 规则 1：已经 HITL 过了，强制进入推荐，不再继续打断
+    if hitl_count >= 1:
+        evaluation = "sufficient"
+        reasoning = "hitl_count>=1，已向用户确认过偏好，直接推荐（即使候选少也硬推）"
+    # 规则 2：候选充足
+    elif has_searched and candidate_count >= min_candidates:
+        evaluation = "sufficient"
+        reasoning = f"候选数{candidate_count}≥{min_candidates}且已执行搜索，无需replan"
+    # 规则 3：候选为 0 → HITL（但单轮只触发一次）
+    elif candidate_count == 0:
+        if hitl_count == 0:
+            evaluation = "hitl_needed"
+            hitl_needed_flag = True
+            reasoning = "候选数=0，hitl_count=0 → 触发HITL向用户询问补充条件"
+            hitl_reason = "没有找到符合条件的商铺"
+            # 规则化模板提问（不再靠 LLM 生成，避免抖动）
+            hitl_question = "抱歉，当前条件下没有找到合适的店。你愿意放宽哪一项呢？"
+            hitl_options = ["扩大搜索距离", "降低评分要求", "提高人均预算", "换个菜系/类别"]
+        else:
+            evaluation = "sufficient"
+            reasoning = "候选数=0但hitl_count>=1，硬兜底sufficient（空推荐说明情况）"
+    # 规则 4：0 < 候选 < min_candidates → 看 replan_count
+    else:  # 0 < candidate_count < min_candidates
+        if replan_count == 0:
+            evaluation = "insufficient"
+            reasoning = f"候选数{candidate_count}<{min_candidates}且replan_count=0 → 走规则级Replan放宽"
+            # 不填 next_tool_calls：Replan 逻辑在 replan_relax_node 里纯规则决定，这里不需要 LLM 生成工具
+            next_tool_calls = []
+        else:
+            evaluation = "sufficient"
+            reasoning = f"候选数{candidate_count}<{min_candidates}但replan_count>=1（已放宽过一轮）→ 直接推荐，候选将附带relaxed标注"
 
     updates = {
         "evaluation": evaluation,
     }
 
-    # Layer 3: Decision logging
+    # 决策日志（保留格式以兼容 eval/runner 指标采集）
     decision = {
         "node": "evaluate",
         "decision": evaluation,
-        "reasoning": parsed.get("reasoning", "")[:200],
-        "prediction": f"Will {'generate' if evaluation == 'sufficient' else 'replan' if evaluation == 'insufficient' else 'interrupt'}",
+        "reasoning": reasoning[:200],
+        "prediction": (
+            "generate" if evaluation == "sufficient"
+            else "interrupt(HITL)" if evaluation == "hitl_needed"
+            else "replan(规则放宽)"
+        ),
         "verified": None,
+        "candidateCount": candidate_count,
+        "replanCount": replan_count,
+        "hitlCount": hitl_count,
     }
     updates["decisions"] = state.decisions + [decision] if state.decisions else [decision]
 
     if evaluation == "hitl_needed":
-        # 防止死循环：已被 HITL 中断过 → 不再中断，直接生成推荐
-        updates["hitl_needed"] = state.hitl_count == 0
-        updates["hitl_question"] = parsed.get("hitl_question") or "你能告诉我更多偏好吗？"
-        updates["hitl_options"] = parsed.get("hitl_options") or []
-        updates["hitl_reason"] = parsed.get("hitl_reason") or ""
-        updates["hitl_count"] = state.hitl_count + 1
+        updates["hitl_needed"] = hitl_needed_flag  # 总是 True 这里，但保留表达式显式
+        updates["hitl_question"] = hitl_question
+        updates["hitl_options"] = hitl_options
+        updates["hitl_reason"] = hitl_reason
+        updates["hitl_count"] = hitl_count + 1
     elif evaluation == "insufficient":
-        raw_next = parsed.get("next_tool_calls", [])
-        updates["tool_calls"], _ = validate_tool_calls(raw_next)
+        # next_tool_calls 留空：Replan 逻辑改为 replan_relax_node 纯规则处理，不再依赖 evaluate 给工具列表
+        updates["tool_calls"], _ = validate_tool_calls(next_tool_calls)
 
+    return updates
+
+
+# --- Replan（规则放宽）节点：零LLM，纯代码放宽筛选并重搜 ---
+
+@timed_node("replan_relax")
+async def replan_relax_node(state: AgentState) -> dict:
+    """
+    【重构 2026-08】规则级放宽筛选条件 → 重搜 → 写入 relaxed_shops + 合并候选。
+
+    单轮最多执行一次（由 replan_count 守卫 + evaluate 规则二次兜底）。
+    放宽策略：
+      - 对 search_shops_nearby：maxPrice × 1.25，minScore − 0.3（下限 3.0）
+      - 对 search_shops_by_keyword：保持 keyword，maxPrice × 1.25，minScore − 0.3
+      - 若原调用没带价格/评分筛选，放宽为"去掉 minScore 限制"以扩大结果集
+    新搜索到的商铺会：
+      ① 与现有 candidate_shops 去重合并（保证 candidate_count 增长）
+      ② 同时写入 relaxed_shops（供 generate 标注 source=relaxed 使用）
+    """
+    import copy
+    replan_count = getattr(state, "replan_count", 0) or 0
+    if replan_count >= 1:
+        # 硬保护：已放宽过 → 直接返回空（理论上 evaluate 规则不会让这条路径走到这里，但防御一下）
+        logger.info(f"replan_relax skipped because replan_count={replan_count} >= 1")
+        return {}
+
+    # 1. 从 tool_results 找到最近一次 search_* 调用的原始参数
+    last_search_tool = None
+    last_search_params: dict | None = None
+    for tr in reversed(state.tool_results):
+        tool = tr.get("tool")
+        if tool in ("search_shops_by_keyword", "search_shops_nearby"):
+            last_search_tool = tool
+            last_search_params = tr.get("params") or {}
+            break
+
+    if not last_search_tool or last_search_params is None:
+        # 没有搜索历史（理论上候选数非 0 就应该有搜索历史），直接放弃放宽
+        logger.warning("replan_relax: no prior search_* tool call found, cannot relax")
+        return {"replan_count": 1}
+
+    # 2. 应用放宽系数构造新参数
+    relaxed_params = copy.deepcopy(last_search_params)
+    original_price_cap = relaxed_params.get("maxPrice") or relaxed_params.get("max_price")
+    original_score_floor = relaxed_params.get("minScore") or relaxed_params.get("min_score")
+
+    changes_applied: list[str] = []
+    # 价格上限放宽 × 1.25
+    if original_price_cap and isinstance(original_price_cap, (int, float)):
+        new_price = int(original_price_cap * 1.25) if isinstance(original_price_cap, int) else round(original_price_cap * 1.25, 2)
+        relaxed_params["maxPrice"] = new_price
+        # 兼容旧命名
+        if "max_price" in relaxed_params:
+            relaxed_params["max_price"] = new_price
+        changes_applied.append(f"maxPrice {original_price_cap} → {new_price}")
+    # 评分下限放宽 −0.3（最低 3.0）
+    if original_score_floor and isinstance(original_score_floor, (int, float)):
+        new_score = max(3.0, float(original_score_floor) - 0.3)
+        relaxed_params["minScore"] = new_score
+        if "min_score" in relaxed_params:
+            relaxed_params["min_score"] = new_score
+        changes_applied.append(f"minScore {original_score_floor} → {new_score}")
+    else:
+        # 原调用没带评分限制 → 显式设一个较低的 3.5 当作"宽松"，避免跟原调用结果完全一样
+        relaxed_params["minScore"] = 3.5
+        changes_applied.append("minScore → 3.5 (未设置时兜底放宽)")
+
+    # 如果是 nearby 搜索，用户坐标必须继承（避免放宽时丢坐标）
+    if last_search_tool == "search_shops_nearby":
+        if not relaxed_params.get("x") and state.user_x:
+            relaxed_params["x"] = state.user_x
+        if not relaxed_params.get("y") and state.user_y:
+            relaxed_params["y"] = state.user_y
+
+    logger.info(f"replan_relax applying changes: {changes_applied}")
+
+    # 3. 重新执行搜索（直接调用 execute_tool，不经过 execute_node，避免影响 tool_calls 状态）
+    try:
+        new_result = await execute_tool(last_search_tool, relaxed_params, state)
+    except Exception as e:
+        logger.error(f"replan_relax re-search failed: {e}")
+        return {"replan_count": 1}
+
+    new_shops = new_result.get("shops", []) if isinstance(new_result, dict) else []
+
+    # 4. 去重合并 + 写入 relaxed_shops
+    existing_ids = set()
+    for s in state.candidate_shops:
+        sid = s.get("shopId") or s.get("id")
+        if sid:
+            existing_ids.add(sid)
+
+    relaxed_shops_list: list[dict] = []
+    merged_extra: list[dict] = []
+    for s in new_shops:
+        shop_copy = dict(s)
+        sid = shop_copy.get("shopId") or shop_copy.get("id")
+        if sid and sid in existing_ids:
+            continue
+        shop_copy["source"] = "relaxed"
+        shop_copy["_relax_reason"] = "; ".join(changes_applied)
+        relaxed_shops_list.append(shop_copy)
+        merged_extra.append(shop_copy)
+        if sid:
+            existing_ids.add(sid)
+
+    # 5. 构造 tool_result 记录（方便 decisions/日志回溯）
+    new_tool_result = {
+        "tool": last_search_tool,
+        "params": relaxed_params,
+        "result": {"shops": relaxed_shops_list, "count": len(relaxed_shops_list), "relaxed": True},
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    # 决策日志
+    decision = {
+        "node": "replan_relax",
+        "decision": "relax_and_research",
+        "reasoning": "规则放宽：" + "; ".join(changes_applied),
+        "prediction": f"新增候选 {len(relaxed_shops_list)} 家（去重后），下一步重新 evaluate",
+        "verified": None,
+        "originalParams": last_search_params,
+        "relaxedParams": relaxed_params,
+        "newShops": len(relaxed_shops_list),
+    }
+
+    updates: dict = {
+        "replan_count": 1,
+        "relaxed_shops": (getattr(state, "relaxed_shops", []) or []) + relaxed_shops_list,
+        "candidate_shops": state.candidate_shops + merged_extra,
+        "tool_results": state.tool_results + [new_tool_result],
+        "iteration_count": state.iteration_count + 1,
+        "decisions": state.decisions + [decision] if state.decisions else [decision],
+    }
     return updates
 
 
 @timed_node("update_memory")
 async def update_memory_node(state: AgentState) -> dict:
     """从用户反馈中提取偏好并更新记忆"""
-    llm = get_llm()
-
     memory_str = json.dumps(state.memory, ensure_ascii=False)
     prompt = MEMORY_UPDATE_PROMPT.format(
         original_message=state.user_message,
@@ -275,7 +480,7 @@ async def update_memory_node(state: AgentState) -> dict:
         memory=memory_str,
     )
 
-    response = await llm.ainvoke([HumanMessage(content=prompt)])
+    response = await call_llm([HumanMessage(content=prompt)])
     parsed = _parse_llm_json(response.content)
 
     new_prefs = parsed.get("newPreferences", {})
@@ -297,9 +502,15 @@ async def update_memory_node(state: AgentState) -> dict:
 
 @timed_node("generate")
 async def generate_recommendation_node(state: AgentState) -> dict:
-    """LLM 综合所有信息生成最终推荐"""
-    llm = get_llm()
+    """
+    LLM 综合所有信息生成最终推荐。
 
+    【2026-08 新增】：
+    - 从 PLAN 输出的 intent_analysis 提取（maxPrice/minScore/avoidKeywords/preferredAreas）
+    - 在 Python 侧先做一遍 client-side 硬过滤：排除关键词命中、价格上限、评分下限
+    - 偏好商圈命中的候选提权
+    - 然后交给 LLM 做 Top-5 选择和文案生成
+    """
     summaries = {}
     for tr in state.tool_results:
         if tr.get("tool") == "get_review_summary":
@@ -312,20 +523,116 @@ async def generate_recommendation_node(state: AgentState) -> dict:
                     "recommendation": result.get("recommendation"),
                 })
 
-    # Token 控制: 截断候选数量（按评分取 Top-N）
-    limited_candidates = limit_candidates_for_prompt(state.candidate_shops)
+    # ---- 提取 PLAN 阶段的 intent_analysis（若存在）----
+    intent_analysis: dict = {}
+    for tr in state.tool_results:
+        # intent_analysis 一般写在 plan_node 的 tool_calls 之外，但有些版本会把解析结果挂在
+        # state.decisions 里；这里优先从 decisions 拿，其次 fallback 从 tool_calls 解析
+        pass
+    # Fallback：从最近一个 plan_node 的输出（通常是 state.plan）中的 JSON 解析，
+    # 但更稳的是在 plan_node 输出后直接挂 decisions；这里改用 state.decisions 中最近的一条 intent_analysis
+    for decision in reversed(state.decisions or []):
+        if isinstance(decision, dict) and "intent_analysis" in decision:
+            intent_analysis = decision["intent_analysis"] or {}
+            break
+
+    max_price = intent_analysis.get("maxPrice") if isinstance(intent_analysis, dict) else None
+    min_score = intent_analysis.get("minScore") if isinstance(intent_analysis, dict) else None
+    avoid_keywords: list[str] = []
+    preferred_areas: list[str] = []
+    if isinstance(intent_analysis, dict):
+        raw_avoid = intent_analysis.get("avoidKeywords") or []
+        raw_area = intent_analysis.get("preferredAreas") or []
+        avoid_keywords = [str(a).strip().lower() for a in raw_avoid if isinstance(a, str) and a.strip()]
+        preferred_areas = [str(a).strip() for a in raw_area if isinstance(a, str) and a.strip()]
+
+    # 合并原始候选 + 放宽候选（放宽候选去重 + 打 source 标记）
+    orig_ids = set()
+    merged: list[dict] = []
+    for s in state.candidate_shops:
+        shop_copy = dict(s)
+        shop_copy.setdefault("source", "original")
+        sid = shop_copy.get("shopId") or shop_copy.get("id")
+        if sid:
+            orig_ids.add(sid)
+        merged.append(shop_copy)
+
+    relaxed_count = 0
+    for s in getattr(state, "relaxed_shops", []) or []:
+        shop_copy = dict(s)
+        shop_copy["source"] = "relaxed"
+        sid = shop_copy.get("shopId") or shop_copy.get("id")
+        if sid and sid in orig_ids:
+            continue
+        merged.append(shop_copy)
+        relaxed_count += 1
+
+    # ---- Client-side 硬过滤（与 GENERATE prompt 的 R2/R3/R4 同步执行，形成双重保障）----
+    filtered: list[dict] = []
+    for shop in merged:
+        # R3: 价格上限
+        if max_price and shop.get("avgPrice") and int(shop["avgPrice"]) > int(max_price):
+            continue
+        # R4: 评分下限
+        if min_score:
+            s = normalize_score(shop.get("score"))
+            if s is not None and s < float(min_score):
+                continue
+        # R2: 排除关键词（子串匹配，大小写不敏感）
+        if avoid_keywords:
+            haystack = " ".join([
+                str(shop.get("name") or ""),
+                str(shop.get("tags") or ""),
+                str(shop.get("area") or ""),
+                str(shop.get("address") or ""),
+            ]).lower()
+            if any(kw and kw in haystack for kw in avoid_keywords):
+                continue
+        filtered.append(shop)
+
+    # ---- 偏好商圈提权：命中的候选提到前面（稳定排序，不打乱其他相对顺序）----
+    if preferred_areas:
+        def _area_hit(shop: dict) -> int:
+            area = str(shop.get("area") or "")
+            return 1 if any(a and a in area for a in preferred_areas) else 0
+        filtered.sort(key=lambda s: (
+            -_area_hit(s),
+            -(normalize_score(s.get("score")) or 0.0),  # 高分在前
+            s.get("distance") if s.get("distance") is not None else 9999.0,  # 近的在前
+        ))
+
+    # Token 控制：按评分取 Top-N 截断候选数量（过滤后再截断）
+    limited_candidates = limit_candidates_for_prompt(filtered)
 
     candidates_str = json.dumps(limited_candidates, ensure_ascii=False)
     memory_str = json.dumps(state.memory.get("preferences", {}), ensure_ascii=False)
     summaries_str = json.dumps(summaries, ensure_ascii=False) if summaries else "无"
 
+    # 给 LLM 看的"我这轮执行了什么过滤"摘要
+    intent_max_price_str = str(max_price) if max_price else "无"
+    intent_min_score_str = f"{min_score}" if min_score else "无"
+    intent_avoid_str = str(avoid_keywords) if avoid_keywords else "（无排除词）"
+    intent_area_str = str(preferred_areas) if preferred_areas else "（无偏好商圈）"
+
+    relaxed_note = ""
+    if relaxed_count > 0:
+        relaxed_note = (
+            f"\n\n【提示】共额外放宽筛选条件找到 {relaxed_count} 家候选（source=relaxed），"
+            "请在最终推荐文案中明确标注「为您放宽条件额外找到：」以区分精确匹配的结果。"
+        )
+
     prompt = GENERATE_SYSTEM_PROMPT.format(
+        user_message=_sv(state, "user_message", ""),
         candidates=candidates_str,
         memory=memory_str,
         review_summaries=summaries_str,
-    )
+        intent_max_price=intent_max_price_str,
+        intent_min_score=intent_min_score_str,
+        intent_avoid_keywords=intent_avoid_str,
+        intent_preferred_areas=intent_area_str,
+    ) + relaxed_note
 
-    response = await llm.ainvoke([HumanMessage(content=prompt)])
+    response = await call_llm([HumanMessage(content=prompt)])
     parsed = _parse_llm_json(response.content)
 
     shops = parsed.get("shops", [])
@@ -337,21 +644,12 @@ async def generate_recommendation_node(state: AgentState) -> dict:
     }
 
 
-# ---- Layer 1: reflect 节点 (从 reflect.py 导入，加 timing) ----
-
-@timed_node("reflect")
-async def reflect_with_timing(state: AgentState) -> dict:
-    """推荐质量自评 — 薄包装 reflect_node 添加 timing"""
-    return await reflect_node(state)
-
-
-# ---- Layer 3: log_trajectory 节点 ----
+# --- log_trajectory 节点 ---
 
 @timed_node("log_trajectory")
 async def log_trajectory_node(state: AgentState) -> dict:
     """
-    持久化执行轨迹到 TrajectoryStore。
-    对应 AHE Experience Observability: 每次执行的完整记录。
+    持久化执行轨迹到 TrajectoryStore（每次执行的完整记录）。
     """
     record = TrajectoryRecord(
         trajectoryId=state.trajectory_id or str(uuid.uuid4()),
@@ -377,10 +675,19 @@ async def log_trajectory_node(state: AgentState) -> dict:
 
     traj_id = trajectory_store.save(record)
 
-    # 生成分析报告
     trajectory_store.analyze_trajectory(record)
 
-    # Layer 2: 如果反思评分低，触发 playbook reflection
+    # ---------- Stage 4 信号管线：入队 + piggyback kick ----------
+    try:
+        from improve import signals as _signals
+        _signals.enqueue_for_distill(traj_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Stage4 enqueue distill failed: {e}")
+
+    # 【注意】Piggyback kick 已统一放在 signals.enqueue_for_distill 里
+    # （检查 piggyback_should_run → 节流 → create_task），避免入队和 kick 分散在两个模块。
+
+    # 评分低于阈值时触发 playbook 反思，蒸馏经验
     if state.reflection_score > 0 and state.reflection_score < config.PLAYBOOK_REFLECTION_THRESHOLD:
         try:
             insights = await playbook.reflect(record)
