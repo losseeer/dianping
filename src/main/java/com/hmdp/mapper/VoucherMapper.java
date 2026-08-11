@@ -17,4 +17,9 @@ import java.util.List;
 public interface VoucherMapper extends BaseMapper<Voucher> {
 
     List<Voucher> queryVoucherOfShop(@Param("shopId") Long shopId);
+
+    /**
+     * 查询全部秒杀券（type=1），包含秒杀库存和开始/结束时间
+     */
+    List<Voucher> queryAllSeckillVoucher();
 }

@@ -10,4 +10,15 @@
         LEFT JOIN  tb_seckill_voucher sv ON v.id = sv.voucher_id
         WHERE v.shop_id = #{shopId} AND v.status = 1
     </select>
+
+    <!-- 秒杀专场：查询全部 type=1 的秒杀券，左连接seckill库存和时间信息 -->
+    <select id="queryAllSeckillVoucher" resultType="com.hmdp.entity.Voucher">
+        SELECT
+            v.`id`, v.`shop_id`, v.`title`, v.`sub_title`, v.`rules`, v.`pay_value`,
+            v.`actual_value`, v.`type`, v.`status`, sv.`stock`, sv.begin_time, sv.end_time
+        FROM tb_voucher v
+        INNER JOIN tb_seckill_voucher sv ON v.id = sv.voucher_id
+        WHERE v.type = 1 AND v.status = 1
+        ORDER BY sv.begin_time DESC, v.id ASC
+    </select>
 </mapper>

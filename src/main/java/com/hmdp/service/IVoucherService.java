@@ -16,5 +16,10 @@ public interface IVoucherService extends IService<Voucher> {
 
     Result queryVoucherOfShop(Long shopId);
 
+    /**
+     * 查询全部秒杀券（秒杀专场页面使用）
+     */
+    Result queryAllSeckillVoucher();
+
     void addSeckillVoucher(Voucher voucher);
 }

@@ -55,24 +55,16 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     private CacheClient clientClient;
     @Override
     public Result queryById(Long id){
-        /*缓存穿透
-        //Shop shop = queryWithPassThrough(id);
-        //Shop shop = clientClient
-               // .queryWithPassThrough(RedisConstants.CACHE_SHOP_KEY, id, Shop.class, this::getById, RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
-
-        //互斥锁解决缓存击穿
-//        Shop shop = queryWithMutex(id);
-//        if(shop==null){
-//            return Result.fail("店铺不存在！");
-//        }
-         */
-
-        //用逻辑过期解决缓存击穿
-        // Shop shop = queryWithLogicalExpire(id);
+        // 先用逻辑过期策略查缓存（热点key场景）
         Shop shop = clientClient.
                 queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        // 逻辑过期策略前提是缓存已预热；如果缓存未命中（非热点/首次访问/Redis未启动），
+        // 再走缓存穿透策略兜底，该策略会主动查DB并回填缓存，方便联调。
+        if (shop == null) {
+            shop = clientClient
+                    .queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        }
         if(shop==null){
-
             return Result.fail("店铺不存在！");
         }
         return Result.ok(shop);

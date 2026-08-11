@@ -49,4 +49,20 @@ public interface IShopSearchService {
      * @return 导入结果
      */
     Result importShop(Shop shop);
+
+    /**
+     * 重建 ES shop 索引（DROP + CREATE + PUT MAPPING + 重新 MySQL 全量导入）。
+     *
+     * 【应用场景】
+     * 1. 修改 synonyms.txt（同义词表）后需要让 synonym_graph filter 立即生效
+     * 2. 调整 analyzer / filter / mapping 后需要重建索引
+     * 3. ES 索引数据损坏或 mapping 写入失败，需要一键修复
+     *
+     * 与 elasticsearch.init.rebuild-on-startup=true 的区别：
+     *   · rebuild-on-startup=true 在 Spring Boot 启动时执行一次
+     *   · 本方法可以在服务运行期间随时调用（无需重启），方便运维与同义词热更新
+     *
+     * @return 重建结果（包含导入的商铺数量、是否成功等）
+     */
+    Result rebuildIndex();
 }

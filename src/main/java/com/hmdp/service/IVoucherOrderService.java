@@ -21,6 +21,23 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
     void handleVoucherOrder(VoucherOrder voucherOrder);
 
     /**
+     * 查询订单（先查 DB，查不到再查 Redis pending 预订单），
+     * 供支付/取消/详情查询的统一入口使用，避免异步落库窗口期出现"订单不存在"。
+     *
+     * @param orderId 订单ID
+     * @return VoucherOrder 或 null
+     */
+    VoucherOrder getOrderWithPending(Long orderId);
+
+    /**
+     * 落库成功后清理 Redis pending 预订单缓存，保证一致性。
+     *
+     * @param orderId  订单ID
+     * @param userId   用户ID（用于清理用户维度索引，可为空）
+     */
+    void evictPendingOrder(Long orderId, Long userId);
+
+    /**
      * 用户发起支付 —— 委托给PaymentService处理
      * 【八股：为什么要委托而不是直接在OrderService里实现？】
      * 1. 单一职责：OrderService管订单生命周期，PaymentService管支付细节

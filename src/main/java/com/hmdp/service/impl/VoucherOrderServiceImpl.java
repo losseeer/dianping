@@ -46,6 +46,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 /**
  * <p>
@@ -65,6 +66,20 @@ import java.util.concurrent.Executors;
 @Slf4j
 @Service
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+
+    /**
+     * 自引用代理（@Lazy 打破循环依赖）。
+     * 替代 AopContext.currentProxy() 方案：避免 Listener 消费线程/非 HTTP 请求线程
+     * 未暴露 AopContext 而导致 proxy 为 null，造成 @Transactional 失效/重复扣库存。
+     */
+    @Resource
+    @Lazy
+    private IVoucherOrderService selfProxy;
+
+    @PostConstruct
+    public void initProxy() {
+        this.proxy = selfProxy;
+    }
 
     @Resource
     private ISeckillVoucherService seckillVoucherService;
@@ -331,27 +346,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             //2.1.不为0，代表没有购买资格
             return Result.fail(r==1?"库存不足":"不能重复下单");
         }
-//        //3.获取代理对象
-//        proxy = (IVoucherOrderService) AopContext.currentProxy();
-//        //4.返回订单id
-//        return Result.ok(orderId);
 
         // 2. 脱离请求线程，发消息给 RabbitMQ
-        // 【八股：为什么要用消息队列异步下单？】
-        // 同步下单的问题：
-        // - 查询优惠券、查询订单、减库存、创建订单，全走数据库
-        // - 还有分布式锁，整个流程耗时长，吞吐量低
-        // - 高并发下异常率高，用户体验差
-        //
-        // 异步下单的优势：
-        // - 快：Redis预检通过就返回，用户秒级响应
-        // - 削峰：把瞬时请求存到MQ，慢慢消费，保护数据库
-        // - 解耦：下单和库存扣减分离，可以独立扩展
-        //
-        // 【八股：异步下单的缺点和注意事项】
-        // - 最终一致性：用户看到下单成功，但实际可能失败（概率很低）
-        // - 需要补偿机制：失败了怎么通知用户？怎么退款？
-        // - 消息丢失问题：需要确认机制、持久化、死信队列
         VoucherOrder order = new VoucherOrder();
         order.setId(orderId);
         order.setUserId(userId);
@@ -361,9 +357,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         // createTime在发送MQ消息前设置，确保落库时有值
         order.setStatus(OrderStatus.UNPAID.getCode());
         order.setCreateTime(LocalDateTime.now());
-        // 你可以用 JSON，也可以用序列化
-        // 增加消息发送的异常处理
-        //放入mq
         String jsonStr = JSONUtil.toJsonStr(order);
         try {
             rabbitTemplate.convertAndSend("X","XA",jsonStr );
@@ -371,8 +364,62 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.error("发送 RabbitMQ 消息失败，订单ID: {}", orderId, e);
             throw new RuntimeException("发送消息失败");
         }
-        // 3. 返回订单号给前端（实际下单异步处理）
+
+        // 3. 写 Redis pending 预订单缓存（解决"下单后立刻点支付/取消 → 订单不存在"）
+        //    - 用户维度索引 ZSet：score = createTime epoch 秒，用于"我的订单"按时间排序
+        //    - 订单维度 String：保存完整订单 JSON，支付/取消/详情/超时取消都能从此处捞
+        try {
+            String pendingKey = RedisConstants.SECKILL_PENDING_ORDER_KEY + orderId;
+            stringRedisTemplate.opsForValue().set(pendingKey, jsonStr,
+                    RedisConstants.SECKILL_PENDING_ORDER_TTL, java.util.concurrent.TimeUnit.MINUTES);
+
+            String userPendingKey = RedisConstants.SECKILL_PENDING_USER_KEY + userId;
+            long epochSec = order.getCreateTime().toEpochSecond(java.time.ZoneOffset.ofHours(8));
+            stringRedisTemplate.opsForZSet().add(userPendingKey, String.valueOf(orderId), epochSec);
+            stringRedisTemplate.expire(userPendingKey,
+                    RedisConstants.SECKILL_PENDING_USER_TTL, java.util.concurrent.TimeUnit.MINUTES);
+        } catch (Exception e) {
+            log.warn("写入 pending 预订单缓存失败，orderId={}", orderId, e);
+        }
+
+        // 4. 返回订单号给前端（实际下单异步处理）
         return Result.ok(orderId);
+    }
+
+    @Override
+    public VoucherOrder getOrderWithPending(Long orderId) {
+        // 1. 先查 DB（真源）
+        VoucherOrder order = getById(orderId);
+        if (order != null) return order;
+        // 2. DB 还未落库：再查 Redis pending 预订单
+        try {
+            String json = stringRedisTemplate.opsForValue().get(RedisConstants.SECKILL_PENDING_ORDER_KEY + orderId);
+            if (json != null && !json.isEmpty()) {
+                VoucherOrder pending = JSONUtil.toBean(json, VoucherOrder.class);
+                // 合法性兜底：必须有 id/userId/voucherId/status
+                if (pending != null && pending.getId() != null
+                        && pending.getUserId() != null && pending.getVoucherId() != null
+                        && pending.getStatus() != null) {
+                    return pending;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("读取 pending 预订单异常，orderId={}", orderId, e);
+        }
+        return null;
+    }
+
+    @Override
+    public void evictPendingOrder(Long orderId, Long userId) {
+        try {
+            stringRedisTemplate.delete(RedisConstants.SECKILL_PENDING_ORDER_KEY + orderId);
+            if (userId != null) {
+                stringRedisTemplate.opsForZSet().remove(
+                        RedisConstants.SECKILL_PENDING_USER_KEY + userId, String.valueOf(orderId));
+            }
+        } catch (Exception e) {
+            log.warn("清理 pending 预订单缓存异常，orderId={}", orderId, e);
+        }
     }
 
 
@@ -454,15 +501,32 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         // 【八股：设置订单初始状态】
         // 确保订单落库时状态为未支付、时间已记录
         voucherOrder.setStatus(OrderStatus.UNPAID.getCode());
-        voucherOrder.setCreateTime(LocalDateTime.now());
+        if (voucherOrder.getCreateTime() == null) {
+            voucherOrder.setCreateTime(LocalDateTime.now());
+        }
         //一人一单
         //查询订单
         Long userId =voucherOrder.getUserId();
-            int count = query().eq("user_id", userId).eq("voucher_id", voucherOrder.getVoucherId()).count();
+        // 【场景补丁：取消/退款后重新秒杀的可用性】
+        //   Lua 在 Redis 层只做了 SISMEMBER 校验，但取消订单会 SREM Redis + 把 DB 行改为 CANCELLED(4)。
+        //   原实现"count>0 就拦"会把历史 CANCELLED/REFUNDED 终态也视为有效单，导致：
+        //   秒杀返回成功 → MQ 异步落库被这里静默 return → pending cache 永远是 pending →
+        //   前端点"立即支付"就会看到「订单创建中 / 用户已经购买过一次了」。
+        //   => 只统计 UNPAID/PAID/USED/REFUNDING 这 4 种"仍占资格"的状态为有效单。
+            int count = query()
+                    .eq("user_id", userId)
+                    .eq("voucher_id", voucherOrder.getVoucherId())
+                    .in("status", Arrays.asList(
+                            OrderStatus.UNPAID.getCode(),
+                            OrderStatus.PAID.getCode(),
+                            OrderStatus.VERIFIED.getCode(),
+                            OrderStatus.REFUNDING.getCode()
+                    ))
+                    .count();
             //判断是否存在
             if (count > 0) {
                 //用户已经购买过了
-                log.error("用户已经购买过一次了");
+                log.error("用户已经购买过一次了（仍存在 UNPAID/PAID/USED/REFUNDING 的有效单）");
                 return;
             }
             //扣减库存 —— 【八股：乐观锁防止超卖的核心代码】
@@ -483,7 +547,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             }
 
             save(voucherOrder);
-
+            // 落库成功后清理 pending 缓存（DB 为真源，缓存只掩盖异步窗口期）
+            evictPendingOrder(voucherOrder.getId(), userId);
     }
 
     // ==================== 交易闭环模块新增方法 ====================
@@ -546,8 +611,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      */
     @Override
     public Result queryOrderById(Long orderId) {
-        // 1. 查询订单
-        VoucherOrder order = getById(orderId);
+        // 1. 使用 (DB + Redis pending) 合并逻辑，解决异步落库窗口"订单不存在"
+        VoucherOrder order = getOrderWithPending(orderId);
         if (order == null) {
             return Result.fail("订单不存在");
         }
@@ -557,56 +622,108 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         Map<String, Object> data = new HashMap<>();
         data.put("order", order);
         data.put("voucher", voucher);
+        // 标记是否来自 pending（未完成异步落库），前端可用于"创建中"展示
+        VoucherOrder dbOrder = getById(orderId);
+        data.put("pending", dbOrder == null);
         return Result.ok(data);
     }
 
     /**
      * 查询我的订单（可按状态筛选）
      *
-     * 【八股：MyBatis-Plus条件构造器】
-     * query()返回LambdaQueryWrapper，支持链式调用：
-     * - eq：等于条件
-     * - eq(condition, ...)：带条件的eq，condition为false时跳过
-     * - orderByDesc：降序排序
-     * - page：分页查询
-     *
-     * eq(status != null, "status", status) 等价于：
-     * if (status != null) { wrapper.eq("status", status); }
-     * 这是MyBatis-Plus的条件查询语法，很常用
+     * 【八股：异步下单后订单列表从哪里来】
+     * 订单列表的"真源"是 tb_voucher_order。但在异步落库窗口期（几十ms~几秒），
+     * 刚秒杀成功的订单还没写DB，此时从 DB 查询会漏掉 → 用户秒杀完立刻跳 /orders 看不到。
+     * 所以这里：
+     *   1. 先查 DB（已经落库的真实订单，分页前 10 条）
+     *   2. 再拿 Redis pending 索引（还没写 DB 的订单），与 DB 结果去重合并
+     *   3. 最终返回的列表不遗漏 pending 订单，且状态筛选仍然生效。
      */
     @Override
     public Result queryMyOrders(Integer status) {
         // 获取当前登录用户
         Long userId = UserHolder.getUser().getId();
-        // 分页查询：第1页，每页10条
+        // 1. DB 真实订单分页
         Page<VoucherOrder> page = query()
                 .eq("user_id", userId)
                 .eq(status != null, "status", status)
                 .orderByDesc("create_time")
                 .page(new Page<>(1, 10));
-        return Result.ok(page.getRecords(), page.getTotal());
+        List<VoucherOrder> records = new ArrayList<>(page.getRecords());
+        Set<Long> seen = new HashSet<>();
+        for (VoucherOrder o : records) seen.add(o.getId());
+
+        // 2. 拼 Redis pending 预订单（只拿最近 20 条，最多补 20 个，避免脏数据）
+        try {
+            String userPendingKey = RedisConstants.SECKILL_PENDING_USER_KEY + userId;
+            java.util.Set<String> pendingIds = stringRedisTemplate.opsForZSet()
+                    .reverseRange(userPendingKey, 0, 19);
+            if (pendingIds != null && !pendingIds.isEmpty()) {
+                for (String idStr : pendingIds) {
+                    long oid;
+                    try { oid = Long.parseLong(idStr); } catch (Exception ignore) { continue; }
+                    if (seen.contains(oid)) continue;
+                    String json = stringRedisTemplate.opsForValue().get(
+                            RedisConstants.SECKILL_PENDING_ORDER_KEY + oid);
+                    if (json == null || json.isEmpty()) continue;
+                    VoucherOrder pending = JSONUtil.toBean(json, VoucherOrder.class);
+                    if (pending == null || pending.getId() == null
+                            || !userId.equals(pending.getUserId()) || pending.getStatus() == null) continue;
+                    if (status != null && !status.equals(pending.getStatus())) continue;
+                    records.add(0, pending); // pending 订单放最前
+                    seen.add(oid);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("合并 pending 预订单到我的列表失败，userId={}", userId, e);
+        }
+
+        // 总数 = DB 总记录数 + 补齐的 pending 数（保守估计）
+        long total = page.getTotal() + (records.size() - page.getRecords().size());
+
+        // 3. 联表 Voucher 补充优惠券展示信息（标题/金额）—— 【为什么不直接 SQL JOIN 查列】
+        //    真实工程里订单列表页只需要展示「券标题 + 应付金额」两列，
+        //    直接 LEFT JOIN 也能做，但 tb_voucher 字段多 + 与 Redis pending 结果合并口径不一致，
+        //    这里用"批量按主键 in 查 Voucher + Map 拼装"的方式更简洁，
+        //    且能同时覆盖 DB + pending 两条来源的订单。
+        if (!records.isEmpty()) {
+            List<Long> voucherIds = records.stream()
+                    .map(VoucherOrder::getVoucherId)
+                    .filter(Objects::nonNull)
+                    .distinct()
+                    .collect(Collectors.toList());
+            Map<Long, Voucher> voucherMap = Collections.emptyMap();
+            if (!voucherIds.isEmpty()) {
+                List<Voucher> vouchers = voucherService.listByIds(voucherIds);
+                if (vouchers != null && !vouchers.isEmpty()) {
+                    voucherMap = vouchers.stream()
+                            .collect(Collectors.toMap(Voucher::getId, v -> v, (a, b) -> a));
+                }
+            }
+            // Result 本身是泛型，外层只认 records 数组，所以每条 record 扩展成 Map（order + voucher）
+            final Map<Long, Voucher> finalVoucherMap = voucherMap;
+            List<Map<String, Object>> enriched = records.stream().map(o -> {
+                Map<String, Object> row = new LinkedHashMap<>();
+                // 先平铺订单字段 —— 复用 BeanUtil 反射属性拷贝，避免手写 DTO 且避免 JSON 转换的类型问题
+                row.putAll(BeanUtil.beanToMap(o));
+                Voucher voucher = finalVoucherMap.get(o.getVoucherId());
+                row.put("voucher", voucher); // voucher 走 Jackson Long→String 序列化，前端直接读 title/payValue
+                return row;
+            }).collect(Collectors.toList());
+            return Result.ok(enriched, total);
+        }
+
+        return Result.ok(records, total);
     }
 
     /**
      * 手动取消订单
-     *
-     * 【八股：取消订单的状态校验】
-     * 只有UNPAID状态的订单才能取消：
-     * - PAID：已经付钱了，不能直接取消，需要走退款流程
-     * - VERIFIED：已核销（已消费），不能取消
-     * - CANCELLED：已经取消了，重复操作没意义
-     * - REFUNDING/REFUNDED：退款中/已退款，不需要取消
-     *
-     * 【八股：为什么要用状态机校验？】
-     * canTransitionTo方法封装了状态转换规则
-     * 调用方不需要记住哪些转换是合法的，只需要问"能不能转"
-     * 如果规则变化（比如允许PAID→CANCELLED），只需要改枚举，不改业务代码
      */
     @Override
     @Transactional
     public Result cancelOrder(Long orderId) {
-        // 1. 查询订单
-        VoucherOrder order = getById(orderId);
+        // 1. 使用 DB+pending 统一入口（解决异步落库窗口下"订单不存在"）
+        VoucherOrder order = getOrderWithPending(orderId);
         if (order == null) {
             return Result.fail("订单不存在");
         }
@@ -620,12 +737,54 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         if (!currentStatus.canTransitionTo(OrderStatus.CANCELLED)) {
             return Result.fail("当前订单状态不允许取消: " + currentStatus.getDesc());
         }
-        // 4. 更新订单状态为已取消
-        order.setStatus(OrderStatus.CANCELLED.getCode());
-        order.setUpdateTime(LocalDateTime.now());
-        updateById(order);
-        // 5. 恢复库存和一人一单记录
-        restoreStockAndOrderRecord(order.getVoucherId(), userId);
+
+        // 4. 如果是 pending 订单（还没写入 DB）—— 先写一张「终态已取消」的 DB 占位行，再做 Redis 回滚。
+        //    【为什么不直接只清 Redis？】
+        //    MQ（QA / 死信 QD）的消费可能比 cancelOrder 晚几十 ms 甚至几分钟：
+        //    直接只清 Redis → cancelOrder 成功返回 → 但之后异步的 handleVoucherOrder 里仍然会
+        //    save(UNPAID) 到 DB → DB 多一条"幽灵 UNPAID" → 该用户下次秒杀进入 createVoucherOrder
+        //    时，SQL count(status ∈ {UNPAID/PAID/VERIFIED/REFUNDING}) > 0 → 被静默拦 → 新订单
+        //    永远 pending → 前端"订单创建中 / 用户已经购买过一次了"。
+        //    解决：先用 PK 同 orderId 持久化一张 status=CANCELLED 的 DB 行到真源里（行锁/唯一约束原子），
+        //    后续异步 save(UNPAID) 会被 DB UNIQUE(order.id) 与 MyBatis-Plus save 的 0 行更新安全兜底，
+        //    状态不会再回滚成 UNPAID。
+        VoucherOrder dbOrder = getById(orderId);
+        if (dbOrder == null) {
+            try {
+                VoucherOrder cancelledRow = new VoucherOrder();
+                cancelledRow.setId(orderId);
+                cancelledRow.setUserId(userId);
+                cancelledRow.setVoucherId(order.getVoucherId());
+                cancelledRow.setStatus(OrderStatus.CANCELLED.getCode());
+                cancelledRow.setCreateTime(order.getCreateTime() != null ? order.getCreateTime() : LocalDateTime.now());
+                cancelledRow.setUpdateTime(LocalDateTime.now());
+                boolean saved = save(cancelledRow);
+                if (!saved) {
+                    // 罕见：主键冲突兜底（并发取消），再次 getById 检查 DB 是否已存在 CANCELLED
+                    log.warn("pending订单写CANCELLED占位失败（可能主键冲突），orderId={}", orderId);
+                    dbOrder = getById(orderId);
+                    if (dbOrder == null) {
+                        return Result.fail("取消订单失败，请稍后再试");
+                    }
+                } else {
+                    log.info("pending订单取消：先写 DB CANCELLED 占位，orderId={}, userId={}", orderId, userId);
+                }
+                restoreStockAndOrderRecord(order.getVoucherId(), userId);
+            } catch (Exception e) {
+                log.warn("pending订单取消时恢复库存失败，orderId={}", orderId, e);
+                return Result.fail("取消订单失败，请稍后再试");
+            }
+            evictPendingOrder(orderId, userId);
+            return Result.ok();
+        }
+
+        // 5. 已经写入 DB 的订单：更新状态 + 恢复库存
+        dbOrder.setStatus(OrderStatus.CANCELLED.getCode());
+        dbOrder.setUpdateTime(LocalDateTime.now());
+        updateById(dbOrder);
+        // 6. 恢复库存和一人一单记录 + 清 pending
+        restoreStockAndOrderRecord(dbOrder.getVoucherId(), userId);
+        evictPendingOrder(orderId, userId);
         log.info("订单已手动取消，orderId={}, userId={}", orderId, userId);
         return Result.ok();
     }
@@ -658,8 +817,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Override
     @Transactional
     public void handleOrderTimeout(Long orderId) {
-        // 1. 查询订单
-        VoucherOrder order = getById(orderId);
+        // 1. 查询订单（DB 为空时再看 pending）——解决：异步落库延迟久 + 延迟队列早到 导致的"订单不存在"
+        VoucherOrder order = getOrderWithPending(orderId);
         if (order == null) {
             log.warn("超时取消失败，订单不存在: orderId={}", orderId);
             return;
@@ -671,12 +830,27 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     orderId, currentStatus.getDesc());
             return;
         }
-        // 3. 更新订单状态为已取消
-        order.setStatus(OrderStatus.CANCELLED.getCode());
-        order.setUpdateTime(LocalDateTime.now());
-        updateById(order);
-        // 4. 恢复库存和一人一单记录
-        restoreStockAndOrderRecord(order.getVoucherId(), order.getUserId());
-        log.info("订单超时自动取消成功: orderId={}, userId={}", orderId, order.getUserId());
+
+        VoucherOrder dbOrder = getById(orderId);
+        if (dbOrder == null) {
+            // 还在 pending 未入 DB：直接回滚 Redis + 清 pending
+            try {
+                restoreStockAndOrderRecord(order.getVoucherId(), order.getUserId());
+            } catch (Exception e) {
+                log.warn("pending订单超时取消恢复库存失败，orderId={}", orderId, e);
+            }
+            evictPendingOrder(orderId, order.getUserId());
+            log.info("pending订单超时取消（未入DB），orderId={}, userId={}", orderId, order.getUserId());
+            return;
+        }
+
+        // 3. 已经入 DB：更新订单状态为已取消
+        dbOrder.setStatus(OrderStatus.CANCELLED.getCode());
+        dbOrder.setUpdateTime(LocalDateTime.now());
+        updateById(dbOrder);
+        // 4. 恢复库存和一人一单记录 + 清 pending
+        restoreStockAndOrderRecord(dbOrder.getVoucherId(), dbOrder.getUserId());
+        evictPendingOrder(orderId, dbOrder.getUserId());
+        log.info("订单超时自动取消成功: orderId={}, userId={}", orderId, dbOrder.getUserId());
     }
 }

@@ -122,8 +122,8 @@ public class PaymentServiceImpl implements IPaymentService {
         Long orderId = dto.getOrderId();
         Integer payType = dto.getPayType();
 
-        // 1. 查订单是否存在、是否是待支付状态
-        VoucherOrder order = voucherOrderService.getById(orderId);
+        // 1. 查订单是否存在、是否是待支付状态（先DB、再Redis pending，防止异步落库窗口"订单不存在"）
+        VoucherOrder order = voucherOrderService.getOrderWithPending(orderId);
         if (order == null) {
             return Result.fail("订单不存在");
         }
@@ -131,6 +131,24 @@ public class PaymentServiceImpl implements IPaymentService {
         OrderStatus currentStatus = OrderStatus.of(order.getStatus());
         if (currentStatus != OrderStatus.UNPAID) {
             return Result.fail("订单状态不允许支付: " + currentStatus.getDesc());
+        }
+
+        // 1.5 如果订单还没真正落库（仍处于 pending 状态），主动立即落库一次（幂等），
+        //     否则下面的 updateById(order)、以及后续支付回调里的 getById 都找不到 DB 记录。
+        VoucherOrder dbOrder = voucherOrderService.getById(orderId);
+        if (dbOrder == null) {
+            log.info("支付时订单尚未落库，主动同步执行落库，orderId={}", orderId);
+            try {
+                voucherOrderService.handleVoucherOrder(order);
+            } catch (Exception e) {
+                log.error("主动同步落库失败，orderId={}", orderId, e);
+                return Result.fail("订单创建中，请稍后再试");
+            }
+            dbOrder = voucherOrderService.getById(orderId);
+            if (dbOrder == null) {
+                return Result.fail("订单创建中，请稍后再试");
+            }
+            order = dbOrder;
         }
 
         // 2. 查优惠券获取支付金额
@@ -172,6 +190,24 @@ public class PaymentServiceImpl implements IPaymentService {
         order.setPayType(payType);
         order.setUpdateTime(LocalDateTime.now());
         voucherOrderService.updateById(order);
+
+        // 7. 对 payType=BALANCE（余额支付，本项目前端默认点击"立即支付"就是余额）直接同步完成回调。
+        //    【为什么需要这一步？】
+        //    原流程：payOrder 只创建 PayLog(status=1) + 返回 payUrl，需要真实扫码→第三方回调→handlePayNotify
+        //    才会把订单状态 UNPAID→PAID。但本地 demo 环境没有第三方扫码渠道，
+        //    用户点击"立即支付"按钮后前端看到仍然是"待支付/立即支付"按钮，体验矛盾
+        //    （也是用户认为"支付失败/订单异常"的第二大触发点）。
+        //    所以余额支付直接 mock 回调：既保留真实沙箱的 PayLog/tradeNo/payUrl 字段，
+        //    又保证订单状态与前端体验一致。其他 payType（微信/支付宝）仍走二维码+回调。
+        PayType payTypeEnum = PayType.of(payType);
+        if (payTypeEnum == PayType.BALANCE) {
+            Result notifyResult = handlePayNotify(tradeNo, orderId);
+            if (notifyResult != null && Boolean.FALSE.equals(notifyResult.getSuccess())) {
+                log.warn("余额支付自动回调失败：orderId={}, msg={}", orderId, notifyResult.getErrorMsg());
+            } else {
+                log.info("余额支付自动完成回调：orderId={}, tradeNo={}", orderId, tradeNo);
+            }
+        }
 
         // 返回支付信息（包含支付链接和流水号）
         Map<String, Object> result = new HashMap<>();

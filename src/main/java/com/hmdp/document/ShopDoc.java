@@ -41,10 +41,10 @@ public class ShopDoc implements Serializable {
 
     /**
      * 商铺名称 —— text类型，支持分词搜索
-     * analyzer = ik_max_word：索引时分词
-     * searchAnalyzer = ik_smart：搜索时分词
+     * analyzer = shop_index_ik：索引时用 ik_max_word，细粒度分词，提高召回率
+     * searchAnalyzer = shop_search_synonym：搜索时用 ik_smart + 同义词扩展（日料↔日式↔寿司等）
      */
-    @Field(type = FieldType.Text, analyzer = "ik_max_word", searchAnalyzer = "ik_smart")
+    @Field(type = FieldType.Text, analyzer = "shop_index_ik", searchAnalyzer = "shop_search_synonym")
     private String name;
 
     /**
@@ -61,14 +61,16 @@ public class ShopDoc implements Serializable {
 
     /**
      * 商圈 —— text类型，支持搜索"陆家嘴"
+     * shop_index_ik 用于索引分词，shop_search_synonym 搜索时启用同义词扩展
      */
-    @Field(type = FieldType.Text, analyzer = "ik_max_word", searchAnalyzer = "ik_smart")
+    @Field(type = FieldType.Text, analyzer = "shop_index_ik", searchAnalyzer = "shop_search_synonym")
     private String area;
 
     /**
      * 地址 —— text类型，支持搜索"杭州西湖"
+     * shop_index_ik 用于索引分词，shop_search_synonym 搜索时启用同义词扩展
      */
-    @Field(type = FieldType.Text, analyzer = "ik_max_word", searchAnalyzer = "ik_smart")
+    @Field(type = FieldType.Text, analyzer = "shop_index_ik", searchAnalyzer = "shop_search_synonym")
     private String address;
 
     /**
@@ -114,11 +116,15 @@ public class ShopDoc implements Serializable {
     private String openHours;
 
     /**
-     * 标签 —— 用于搜索"好吃""牛排"
+     * 标签 —— 用于搜索"好吃""牛排""日料"等
      * 【八股：为什么tags用text？】
      * 因为用户搜索"好吃"时，要匹配到标签中包含"好吃"的商铺
      * 如果用keyword，只能精确匹配整个标签
+     *
+     * analyzer = shop_index_ik：索引时用 ik_max_word 细粒度分词，提高召回
+     * searchAnalyzer = shop_search_synonym：搜索时用 ik_smart + 同义词扩展
+     *   例：用户搜"日料"会扩展为"日料 OR 日本料理 OR 日式 OR 寿司 OR 刺身 OR 居酒屋"
      */
-    @Field(type = FieldType.Text, analyzer = "ik_max_word", searchAnalyzer = "ik_smart")
+    @Field(type = FieldType.Text, analyzer = "shop_index_ik", searchAnalyzer = "shop_search_synonym")
     private String tags;
 }

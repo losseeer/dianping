@@ -32,6 +32,15 @@ spring:
 elasticsearch:
   rest:
     uris: http://127.0.0.1:9200
+  init:
+    # 【关键】启动时强制 DROP+重建 shop 索引（settings+mappings 包含 synonym_graph filter + IK 双 analyzer）
+    # 目的：修复「ES 同义词 Graph Filter 从未写入 ES」的断口。
+    # 使用建议：
+    #   · 首次部署 / 修改 synonyms.txt / 修改 analyzer 配置 时设为 true，重启一次即可完成重建
+    #   · 重建完成后可改回 false（避免每次重启都删数据重导），或调用 POST /shop/search/rebuild-index 管理接口
+    rebuild-on-startup: true
+    shards: 1
+    replicas: 0
 mybatis-plus:
   type-aliases-package: com.hmdp.entity # 别名扫描包
 logging:

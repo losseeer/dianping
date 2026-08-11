@@ -20,6 +20,23 @@ public class RedisConstants {
      * 完整key: seckill:order:{voucherId}
      */
     public static final String SECKILL_ORDER_KEY = "seckill:order:";
+
+    /**
+     * 秒杀预订单（未完成落库的订单）缓存前缀 —— String，value=VoucherOrder JSON
+     * 作用：秒杀返回后MQ异步写DB的窗口期，支付/取消/查详情/订单列表都能从此处捞到订单，
+     *      避免前端立刻点"立即支付/取消订单"时出现"订单不存在"。
+     * 完整key: seckill:order:pending:{orderId}
+     */
+    public static final String SECKILL_PENDING_ORDER_KEY = "seckill:order:pending:";
+    public static final Long SECKILL_PENDING_ORDER_TTL = 10L;
+
+    /**
+     * 用户维度的未完成预订单索引 —— ZSet，value=orderId，score=createTime秒级时间戳
+     * 作用："我的订单"列表先查DB，再补此索引里的 pending 订单，避免秒杀后立刻跳订单页看不到。
+     * 完整key: seckill:order:pending:user:{userId}
+     */
+    public static final String SECKILL_PENDING_USER_KEY = "seckill:order:pending:user:";
+    public static final Long SECKILL_PENDING_USER_TTL = 10L;
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";

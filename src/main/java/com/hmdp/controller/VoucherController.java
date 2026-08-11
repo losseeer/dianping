@@ -54,4 +54,14 @@ public class VoucherController {
     public Result queryVoucherOfShop(@PathVariable("shopId") Long shopId) {
        return voucherService.queryVoucherOfShop(shopId);
     }
+
+    /**
+     * 秒杀专场：查询全部有效秒杀券（跨店铺）
+     * 前端 Seckill.vue / 首页秒杀预览区 调用
+     * @return 秒杀券列表，包含 stock / beginTime / endTime
+     */
+    @GetMapping("/seckill/list")
+    public Result queryAllSeckillVoucher() {
+        return voucherService.queryAllSeckillVoucher();
+    }
 }

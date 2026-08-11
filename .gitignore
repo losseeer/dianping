@@ -45,6 +45,7 @@ logs/
 ### 个人文档
 docs/czk.jpg
 docs/resume*
+docs/original_README.md
 
 ### Redis
 dump.rdb

@@ -2,7 +2,8 @@
 
 > Interview Q&A
 >
-> 快评 Java 后端 + 智能推荐 Agent 项目 — 35 道深度面试题参考回答
+> 快评 Java 后端 + 智能推荐 Agent 项目 — 50 道深度面试题参考回答
+> （Q1-Q35 基础+综合；Q36-Q50 为 2026-08 重构后的深度追问，紧扣实际代码）
 
 ## 目录
 
@@ -23,6 +24,18 @@
 **三、基础知识 & 综合能力（Q28-Q32）**
 
 **四、压力测试 / 开放题（Q33-Q35）**
+
+**五、深度追问：Agent2 重构与自进化闭环（Q36-Q45）**
+
+- evaluate 纯规则化 / replan_relax 规则放宽（Q36-Q37）
+- fuzzy_mapping 编码 / outcome 重判入队 / 双保险批处理（Q38-Q40）
+- 双阈值信号判定 / 偏好合并 / Chroma RAG / augment 匹配（Q41-Q44）
+- PLAN prompt 硬约束验证（Q45）
+
+**六、深度追问：后端工程细节（Q46-Q50）**
+
+- @Lazy 循环依赖 / 逻辑过期 Double Check / rebuild 幂等（Q46-Q48）
+- 熔断器探针超时 / 秒杀 Set 内存（Q49-Q50）
 
 ---
 
@@ -562,58 +575,60 @@ score 用时间戳，`ZREVRANGEBYSCORE` 或 `ZRANGE` 按时间排序：
 
 ## ReAct 工作流
 
-### Q17. LangGraph 8 节点状态图：8 个节点分别是什么？条件路由怎么判断？最多 3 轮重规划超过了怎么办？
+### Q17. LangGraph 状态图：节点分别是什么？条件路由怎么判断？【2026-08 重构后】
 
-#### 8 个节点及状态流转图
+#### 节点及状态流转图（8 节点 + 1 条条件边）
 
 ```
   load_memory → plan → execute → evaluate
                                    │
                           ┌────────┼────────┐
                           ▼        ▼        ▼
-                     interrupt   generate  replan
-                     (END)         │     (→ plan)
+                     interrupt   generate  replan_relax
+                     (END)         │     (→ evaluate 二次判定)
                                    ▼
-                                reflect
-                                   │
-                              ┌────┴────┐
-                              ▼         ▼
-                           replan      log
-                          (→ plan)   (→ END)
+                              log_trajectory → END
+
+  HITL resume: update_memory → plan（带着用户反馈重新规划）
 ```
 
-**8 个节点**：
+**8 个节点**（`graph/builder.py`）：
 
-1. `load_memory`：加载用户长期记忆 + 会话上下文摘要 + Playbook 经验库
-2. `plan`：LLM 分析用户意图，选择工具调用策略（调用哪些工具、参数是什么）
-3. `execute`：执行工具调用（6 个白名单工具），获取商铺候选集
-4. `evaluate`：评估候选集是否充分（品类匹配？数量够？需要追问用户？）
-5. `generate`：生成推荐结果 + matchReason + 格式化输出
-6. `reflect`：反思推荐质量，自评打分，蒸馏经验
-7. `update_memory`：更新用户偏好记忆 + 会话上下文
-8. `log_trajectory`：记录完整执行轨迹，供评测和 Playbook 改进使用
+1. `load_memory`：加载用户 9 维长期偏好 + 会话上下文摘要 + Playbook 经验库（含 augment_summary 模糊词补全）
+2. `plan`：LLM 分析用户意图，输出 intent_analysis + tool_calls + hitl_needed
+3. `execute`：执行工具调用（6 个白名单工具），候选商铺去重合并到 candidate_shops，过滤已推荐商铺
+4. `evaluate`：**纯规则判定**（零 LLM），5 条规则判定 sufficient / insufficient / hitl_needed
+5. `replan_relax`：**纯规则放宽**（零 LLM），maxPrice×1.25 / minScore−0.3 重搜，单轮最多一次
+6. `update_memory`：HITL resume 后从用户反馈提取偏好，增量 merge 写 MySQL+Redis
+7. `generate`：client-side 硬过滤（价格/评分/排除词）+ 偏好商圈提权后，LLM 生成 Top-5 推荐
+8. `log_trajectory`：持久化轨迹 + 触发 Layer 4 自进化入队 + 离线触发 playbook.reflect()
 
-#### 条件路由判断（routing.py）
+> **【重构要点】** 旧版的 `reflect` 节点和 `should_replan` 条件边已从主请求路径移除。reflect 改为在 `log_trajectory` 内部按 `reflection_score < 6.0` 离线触发，不再阻塞主请求。replan 改为 `replan_relax` 纯规则节点，不调 LLM。
 
-evaluate 之后有 3 条路径：
+#### 条件路由判断（routing.py should_hitl / judge_candidates）
+
+evaluate 之后有 3 条路径（`add_conditional_edges`）：
 
 ```python
 def should_hitl(state) -> str:
-    if hitl_needed:
-        return "interrupt"      # 信息不足，中断等待用户补充
-    elif evaluation == "sufficient":
-        return "generate"        # 候选集充分，生成推荐
-    elif iteration_count >= MAX_ITERATIONS:  # 最多3轮
-        return "generate"       # 超过上限，强制生成
-    else:
-        return "replan"          # 重新规划
+    if hitl_needed and hitl_count <= 1:
+        return "interrupt"      # HITL 打断，等用户补充
+    if evaluation == "sufficient":
+        return "generate"        # 候选充分，生成推荐
+    if evaluation == "insufficient":
+        if iteration_count >= AGENT2_MAX_ITERATIONS:  # 最多 3 轮
+            return "generate"   # 超限强制生成
+        return "relax"           # 规则放宽重搜，回 evaluate 二次判定
+    return "generate"            # 异常兜底
 ```
 
-reflect 之后有 2 条路径：如果 `should_replan=True` → 回到 plan 重新规划；否则 → log_trajectory → END。
+#### 防止无限循环的三重保障
 
-#### 超过 3 轮怎么办？
+1. **replan_count 守卫**：replan_relax 内部检查 `replan_count >= 1` 直接返回空，单轮最多放宽一次
+2. **evaluate 规则兜底**：replan_count ≥ 1 时 evaluate 强制 sufficient（规则 5），不会再走 relax
+3. **iteration_count 硬上限**：`AGENT2_MAX_ITERATIONS = 3`，超限 routing 强制 generate
 
-当 `iteration_count >= 3` 时，不再重新规划，直接跳到 `generate` 强制生成推荐。这样防止 Agent 陷入无限循环。同时会记录"因达到最大迭代次数而强制生成"的标记，供后续反思和评测分析。
+> **单轮最多一次 HITL**：`hitl_count >= 1` 后 evaluate 规则 1 强制 sufficient，避免反复打断用户。
 
 ### Q18. HITL 人工接管：中断状态存了什么？为什么不用 LangGraph 的 checkpoint？恢复时从断点继续还是从头？
 
@@ -650,24 +665,34 @@ reflect 之后有 2 条路径：如果 `should_replan=True` → 回到 plan 重�
 
 ### Q19. 工具调用：6 个白名单工具分别是什么？参数是 LLM 生成的吗？格式不对怎么处理？
 
-#### 6 个白名单工具
+#### 6 个白名单工具（`graph/nodes.py execute_tool`）
 
-1. **search_by_category**：按品类搜索商铺（参数：typeId, x, y, limit）
-2. **search_by_keyword**：按关键词全文搜索（参数：keyword, x, y, limit）
-3. **search_nearby**：按距离搜索附近商铺（参数：x, y, radius, limit）
-4. **get_shop_detail**：获取商铺详情（参数：shopId）
-5. **get_shop_reviews**：获取商铺评价（参数：shopId, limit）
-6. **filter_by_tags**：按标签过滤商铺（参数：tags, shopIds）
+| 工具名 | 参数 | 何时用 |
+|---|---|---|
+| `search_shops_by_keyword` | keyword, [maxPrice], [minScore] | 细分类（日料/火锅/咖啡…）或具体店名；走 Java `/shop/search`（ES synonym_graph + 熔断器） |
+| `search_shops_nearby` | typeId, x, y, [maxPrice], [minScore] | 泛化需求（找个吃饭的地方）或强调附近；先 `get_shop_types` 拿 typeId |
+| `get_shop_detail` | shopId | 候选已拿到，只对 1~2 家重点补详情（不要全量调） |
+| `get_shop_types` | — | 不知道 typeId 时先调；只返回大类，细分一律走 keyword 工具 |
+| `get_review_summary` | shopId | Top-1/2 候选做好评度验证（调 Agent1，不要全量调） |
+| `get_shop_reviews` | shopId, [limit] | Agent1 摘要为空时的降级手段 |
+
+> **【关键约束】** keyword 必须是「单个核心品类词」，禁止带地名/修饰/整句。同义词扩展交给 ES synonym_graph（keyword=寿司 → 自动召回日料/刺身/居酒屋），不需要 LLM 在 prompt 里手工列举。
 
 #### 参数是 LLM 生成的吗？
 
-**是的**。在 plan 节点，LLM 根据用户消息 + 上下文，输出一个 JSON 格式的工具调用计划：
+**是的**。plan 节点 LLM 输出 JSON 格式的工具调用计划：
 
 ```json
 {
-    "tool": "search_by_category",
-    "params": {"typeId": 1, "x": 120.17, "y": 30.31, "limit": 20},
-    "reasoning": "用户想找火锅，先按美食品类搜索"
+  "reasoning": "用户想找日料，按 memory.maxPrice=120 传 maxPrice",
+  "intent_analysis": {
+    "keyword": "日料",
+    "maxPrice": 120,
+    "avoidKeywords": [],
+    "preferredAreas": []
+  },
+  "tool_calls": [{"name": "search_shops_by_keyword", "params": {"keyword": "日料", "maxPrice": 120}}],
+  "hitl_needed": false
 }
 ```
 
@@ -676,9 +701,11 @@ reflect 之后有 2 条路径：如果 `should_replan=True` → 回到 plan 重�
 本项目用**多层防御**处理 LLM 输出格式问题：
 
 1. **JSON 解析容错**：`_parse_llm_json()` 先尝试标准 JSON 解析，失败后用正则提取 `{...}` 部分重试
-2. **参数类型校验**：Pydantic 模型自动校验参数类型，typeId 传了字符串会自动转为 int
-3. **默认值兜底**：如果必填参数缺失，使用合理默认值（如 limit 默认 10）
-4. **重规划机制**：如果工具执行失败（如 typeId 不存在），evaluate 节点会判定为"不充分"，触发 replan 让 LLM 重新选择工具和参数
+2. **工具白名单校验**：`guard.validate_tool_calls()` 过滤非法工具名，只保留 6 个白名单工具
+3. **Pydantic 强类型**：ChatRequest/ResumeRequest `userId: int = Field(gt=0)`，类型不匹配自动报错
+4. **默认值兜底**：maxPrice/minScore 缺失时传 null，工具内部做 client-side 后过滤
+5. **replan_relax 兜底**：工具执行返回候选不足时，规则放宽重搜（不依赖 LLM 重新规划）
+6. **seen_shop_ids 去重**：execute_node 自动过滤已推荐商铺，LLM 不需要手动排除
 
 > **关键设计：**不要完全信任 LLM 的输出。每个工具的参数都有 schema 约束，LLM 的输出只是"建议"，最终执行前要过一道类型检查和范围校验。这是 Agent 系统的通用设计原则。
 
@@ -823,29 +850,37 @@ Baseline 中 12 个用例有 ~4 个直接产生推荐（不需要 HITL）。移�
 
 #### 评分标准
 
-reflect 节点让 LLM 对本次推荐打分，评分维度包括：
+`log_trajectory` 节点末尾，如果 `reflection_score` 存在且低于阈值，**离线触发** `playbook.reflect()` 蒸馏经验（不再有独立的 reflect 串行节点阻塞主请求）。
 
-- **意图匹配度**：推荐是否匹配用户的品类/偏好/意图
-- **候选充分性**：候选商铺数量是否足够
-- **HITL 必要性**：是否在不必要的时候触发了 HITL
-- **理由质量**：matchReason 是否有说服力
+> **【两个不同的阈值，不要混淆】**
+> - `PLAYBOOK_REFLECTION_THRESHOLD = 6.0`：在 `log_trajectory_node` 中，`reflection_score < 6.0` 触发 `playbook.reflect()` 蒸馏失败经验（写入 Playbook 经验库）
+> - `reflectionScore < 4.0`：在 `signals.detect_acceptance` 中，`0 < reflectionScore < 4.0` 直接跳过蒸馏（烂轨迹不学，不作为 accepted 信号蒸馏偏好）
+>
+> 区别：前者是"反思一下这次哪里做得不好，提取操作规则"；后者是"这次太烂了，连偏好都不要从里面学"。一个 6 分触发反思，一个 4 分直接丢弃。
 
-综合评分 0-10 分，存储在 `reflectionScore`。
+#### 触发蒸馏的流程
 
-#### 触发蒸馏的阈值
+```
+log_trajectory_node 末尾：
+  if 0 < reflection_score < 6.0:   # PLAYBOOK_REFLECTION_THRESHOLD
+      insights = await playbook.reflect(record)   # LLM 蒸馏操作规则
+      await playbook.curate(insights, source="reflection")  # 去重合并
 
-当 `reflectionScore < 7` 或推荐执行中有异常（如 HITL 触发、迭代超过 2 轮、候选数量不足），触发 reflect 蒸馏流程。也有些规则是在**成功**时蒸馏的——"什么做得好"也是经验。
+  # 同时 enqueue_for_distill(traj_id) 触发 Layer 4 信号管线
+  # detect_acceptance 判定：reflectionScore < 4.0 → 直接跳过
+```
 
 #### 自评不准怎么办？
 
 这是 LLM 自评的核心问题。本项目的缓解措施：
 
 1. **置信度校准**：Playbook 条目的 confidence 不是 LLM 直接给的，而是通过 `timesHelpful / timesApplied` 计算——只有被多次应用且确实有效时，confidence 才会升高
-2. **去重精炼**：`deduplicate()` 方法定期清理重复和低质量条目，防止 context collapse（规则膨胀到不可用）
-3. **上限控制**：Playbook 最多 200 条（`PLAYBOOK_MAX_ENTRIES = 200`），超过就按 confidence 排序裁剪
-4. **外部验证**：评测体系的 LLM-as-Judge 是独立评分（不是自评），可以作为客观验证手段
+2. **显式 outcome 双轨信号**：用户点击查看详情（accepted）或点踩（rejected）作为 ground truth，权重高于 LLM 自评。`detect_acceptance` 中 `outcome == "accepted"` 直接返回 True，覆盖隐式信号
+3. **去重精炼**：`deduplicate()` 方法定期清理重复和低质量条目，防止 context collapse
+4. **上限控制**：Playbook 最多 200 条（`PLAYBOOK_MAX_ENTRIES = 200`），超过按 confidence 排序裁剪
+5. **低置信度不入库**：`PLAYBOOK_MIN_NOVELTY = 0.5`，curate 时 confidence < 0.5 的 insight 直接跳过
 
-> **更彻底的方案：**引入用户反馈（点赞/踩）作为 ground truth，替代 LLM 自评。如果用户对推荐点了踩，说明推荐确实不好，直接触发 reflect 蒸馏。这是最可靠的信号，但需要前端支持。
+> **更彻底的方案：**显式 outcome 已经接入（`POST /agent2/trajectory/{id}/outcome`），用户反馈作为最高权重信号，清除 processed marker 后重新入队蒸馏，解决「信号判过一次就锁死」的半吊子链路。
 
 ### Q25. 自改进循环：propose-evaluate-accept 流程？LLM 能改什么不能改什么？怎么防止改坏？回滚机制？
 
@@ -1170,3 +1205,499 @@ Harness 原意是"马具/线束"，在 Agent 领域指**LLM 的运行时框架**
 - **异步预加载**：用户打开 App 时预加载附近热门商铺到本地，减少首次搜索延迟
 
 > **核心思路：**从"LLM 直接处理全量数据"变为"搜索引擎粗筛 → LLM 精排"。这是推荐系统的经典架构——召回层用工程手段（ES/向量搜索）快速缩小范围，排序层用 LLM 做个性化推荐。Agent 不是要替代搜索引擎，而是要在搜索引擎的基础上做更智能的决策。
+
+---
+
+## 五、深度追问：Agent2 重构与自进化闭环
+
+> 这一节是面试官针对 2026-08 重构后的代码细节做的深度追问，每一题都对应实际代码，不是纯理论。
+
+### Q36. evaluate 为什么从 LLM 判断改成纯规则？5 条规则是什么？损失了什么灵活性？
+
+#### 改的原因
+
+旧版 evaluate 让 LLM 判断候选是否"充分"（sufficient/insufficient/vague），有三个问题：
+
+1. **延迟**：多一次 LLM 调用，端到端 P95 从 ~2s 涨到 ~4s
+2. **抖动**：同样的候选数（比如 2 家），LLM 时而判 sufficient 时而判 vague，导致同一输入两次结果不同
+3. **成本**：每次请求多消耗 ~800 token，1200 次对话多花约 100 万 token
+
+#### 5 条规则（`nodes.py evaluate_node`）
+
+| 规则 | 条件 | 判定 | 理由 |
+|---|---|---|---|
+| 1 | hitl_count ≥ 1 | sufficient | 已打断过用户，不再二次打断 |
+| 2 | has_searched 且 candidate ≥ MIN_CANDIDATES(3) | sufficient | 候选充足 |
+| 3 | candidate == 0 且 hitl_count == 0 | hitl_needed | 没找到，问用户放宽哪一项 |
+| 4 | 0 < candidate < 3 且 replan_count == 0 | insufficient | 候选偏少，走规则放宽 |
+| 5 | 0 < candidate < 3 且 replan_count ≥ 1 | sufficient | 放宽过仍少，硬推 |
+
+#### 损失了什么灵活性？
+
+损失了"LLM 能理解语义层面的候选是否充分"的能力。比如候选 5 家但都是同一家连锁的不同分店，LLM 可能判"多样性不足"走 replan，纯规则只看数量会判 sufficient。
+
+**但这个损失是可接受的**：①多样性由 generate 节点的 client-side 过滤 + LLM Top-5 选择保证；②replan_relax 的规则放宽能覆盖"候选偏少"的最常见场景；③换来的延迟降低和稳定性提升远大于损失。
+
+> **面试追问点**：如果规则覆盖不了所有场景怎么办？答：evaluate 规则只负责"候选数够不够"这种结构化判断，语义质量判断交给 generate 节点的 LLM。分层职责清晰。
+
+### Q37. replan_relax 为什么不用 LLM 重新规划？maxPrice×1.25 / minScore−0.3 这两个系数怎么来的？
+
+#### 不用 LLM 重新规划的原因
+
+1. **LLM replan 不可控**：LLM 可能换工具、换 keyword，导致完全不同的搜索方向，候选集不连续
+2. **延迟**：又多一次 LLM 调用
+3. **候选不足的最常见原因是筛选太严**：价格上限太低、评分下限太高。规则放宽这两个参数就能解决 80% 的情况
+
+#### 系数怎么来的
+
+- **maxPrice × 1.25**：用户说"人均 100 以内"但只找到 1 家，放宽到 125 元是合理的人均上浮（一顿饭涨 25 元可接受）。1.5× 太激进（150 元可能超出预算），1.1× 太保守（110 元可能还是找不到）
+- **minScore − 0.3（下限 3.0）**：评分 4.5 降到 4.2 是合理的质量妥协；下限 3.0 防止放宽到垃圾商铺（3.0 以下基本是差评店）
+
+#### 单轮最多一次的守卫
+
+`replan_relax_node` 内部 `if replan_count >= 1: return {}`，加上 evaluate 规则 5 兜底，保证不会无限放宽。放宽过一轮还是候选少，说明这个商圈/品类本身就少，硬推 + 标注 source="relaxed" 让用户知道。
+
+> **为什么标注 source="relaxed"？** generate 节点会在推荐文案里明确写「为您放宽条件额外找到：」，让用户知道这些候选不完全是按原始条件匹配的，管理用户预期。
+
+### Q38. fuzzy_mapping 为什么编码在 description 字符串里而不是单独建列/建表？正则解析的性能开销？
+
+#### 编码格式
+
+```
+description = "[fuzzy_mapping] trigger:"附近" normalized:"约5km范围内" evidence:max_distance=4.20@5shops"
+```
+
+用正则 `_MAPPING_RE` 解析出 trigger 和 normalized。
+
+#### 为什么不单独建列/建表？
+
+1. **零 schema 变更**：tb_agent_playbook 表结构不变，Playbook 条目的 category="intent_parsing" + description 就能存，不需要 DDL 迁移
+2. **复用现有 RAG 链路**：Chroma 向量索引直接对 description 做 embedding，fuzzy_mapping 条目和普通经验条目走同一条检索路径
+3. **向后兼容**：普通经验条目（reflection 产出的）description 是自然语言，fuzzy_mapping 条目 description 是结构化编码，两者共存互不干扰。`parse_mapping_description` 解析失败就当普通条目处理
+
+#### 正则解析的性能开销
+
+**可忽略**。Playbook 上限 200 条，augment_summary 每次最多对 200 条做 `parse_mapping_description`，正则匹配是 O(n) 级别，200 条 < 1ms。比 LLM 调用快 4 个数量级。
+
+#### 重复命中时怎么更新？
+
+`add_mapping_entries` 对相同 trigger+normalized 的条目做**指数加权更新**：
+
+```python
+updated_conf = (match_e.confidence * old_hits + new_conf) / new_hits
+match_e.confidence = min(1.0, updated_conf + 0.03)  # +3% 命中奖励
+match_e.timesApplied = new_hits
+```
+
+不是简单覆盖，而是按历史命中次数加权——命中越多次的条目，新 confidence 对它的影响越小（越稳定）。+3% 是命中奖励，鼓励被反复验证的规则。
+
+### Q39. outcome 重判入队：为什么必须清除 processed marker？不清除会怎样？
+
+#### 不清除会怎样
+
+`pop_pending_batch` 出队时会先做幂等预过滤：
+
+```python
+for tid in ids:
+    if is_processed(tid):   # processed marker 存在 → 直接跳过
+        to_rem.append(tid)
+    else:
+        out.append(tid)
+```
+
+如果 outcome 更新后不清除 `agent2:distill:done:{trajectory_id}`，下次出队时 `is_processed` 返回 True，这条轨迹直接被跳过——**更精准的显式信号（用户点了查看详情=accepted）永远不会被学到**。
+
+#### 完整重判流程
+
+```python
+# main.py update_trajectory_outcome
+trajectory_store.update_outcome(traj_id, outcome, feedback)
+r.delete(f"{PROCESSED_PREFIX}{trajectory_id}")      # 1. 清除 processed marker
+enqueue_for_distill(traj_id, schedule_piggyback=True)  # 2. 重新入队 + piggyback kick
+```
+
+- **步骤 1**：清除 marker，让 `pop_pending_batch` 能重新捞出这条轨迹
+- **步骤 2**：重新入队 ZSet（score=now）+ 触发 piggyback fire-and-forget 近实时蒸馏
+
+#### 为什么 piggyback kick 而不是等 daemon？
+
+显式反馈是高权重信号（用户明确表达满意/不满意），应该尽快学习生效。piggyback 30s 节流后立即跑一批，比 daemon 5min 兜底快 10 倍。如果是隐式信号（outcome=unknown），可以容忍 5min 延迟；显式信号不行。
+
+> **这是"自进化真闭环"的关键差异点**：很多项目做了"用户反馈→存 outcome"就停了，但 outcome 存了不重新蒸馏等于没存。清除 marker + 重入队才让显式信号真正闭环。
+
+### Q40. piggyback 30s 节流 + daemon 5min 兜底，为什么不只用一个？各自覆盖什么失败场景？
+
+#### 两个机制各自的参数
+
+| 机制 | 触发方式 | 频率 | 单批上限 | 时间预算 |
+|---|---|---|---|---|
+| Piggyback | log_trajectory 后 fire-and-forget | 30s 节流 | 4 条 | 2.5s |
+| Daemon | FastAPI startup 后台 asyncio 循环 | 5min | 16 条 | 无限制 |
+
+#### 为什么不只用 piggyback？
+
+1. **piggyback 依赖请求线程触发**：如果没有新请求（比如凌晨低峰），轨迹一直堆在 ZSet 里没人触发 piggyback
+2. **piggyback 有 30s 节流**：大流量下可能漏掉部分轨迹（30s 内只跑一次，最多 4 条，积压超过 4 条的只能等下一轮）
+3. **piggyback 有 2.5s 时间预算**：超了就留给下一轮，可能一直跑不完
+
+#### 为什么不只用 daemon？
+
+1. **5min 延迟太长**：用户刚反馈 accepted，要等 5min 才学到，下一轮对话可能还没生效
+2. **daemon 是空轮询**：没有请求时也在跑，浪费资源
+
+#### 互补关系
+
+- **正常流量**：piggyback 先跑，daemon 通常看到空批（ZSet 已被 piggyback 清空）
+- **异常场景**（LLM 慢导致请求线阻塞 / 重启漏跑一批 / 大流量积压）：daemon 5min 后补捞
+
+> **MIN_COOL_SECONDS = 60**：轨迹落盘后至少等 60s 才蒸馏。原因是用户可能在 30s 内连续 follow-up（"换一家"→"再换一家"），过早蒸馏会把不稳定的单次请求当经验。等 60s 让交互稳定下来再学。
+
+### Q41. detect_acceptance 有两个阈值：reflectionScore<4 跳过、<6 触发 reflect，为什么不一样？
+
+这是两个不同维度的判断，不要混淆：
+
+#### 阈值 4.0：detect_acceptance 的"烂轨迹跳过"
+
+```python
+# signals.py detect_acceptance
+if 0 < record.reflectionScore < 4.0:
+    return False  # 烂轨迹不学，不作为 accepted 信号蒸馏偏好
+```
+
+**含义**：评分 < 4 说明这次推荐很烂（比如候选 0 家、HITL 3 次还说不对），从烂推荐里蒸馏"用户偏好"会学错（用户不满意不等于偏好这些店）。所以直接跳过 preference_distill。
+
+#### 阈值 6.0：log_trajectory 的"触发 reflect 蒸馏操作规则"
+
+```python
+# nodes.py log_trajectory_node
+if state.reflection_score > 0 and state.reflection_score < config.PLAYBOOK_REFLECTION_THRESHOLD:  # 6.0
+    insights = await playbook.reflect(record)  # LLM 蒸馏操作规则
+```
+
+**含义**：评分 < 6 说明这次不够好，让 LLM 反思"哪里做得不好"，提取**可执行的操作规则**（如"环境偏好应优先于价格筛选"）。这些规则是跨用户通用的，写入 Playbook 经验库。
+
+#### 为什么不一样？
+
+| 维度 | 阈值 4.0（detect_acceptance） | 阈值 6.0（log_trajectory reflect） |
+|---|---|---|
+| 学什么 | 用户偏好（per-user） | 操作规则（全局） |
+| 从哪种轨迹学 | 成功轨迹（accepted） | 不够好的轨迹（反思） |
+| 为什么阈值不同 | 偏好学习要求轨迹质量高（烂轨迹学偏） | 反思恰恰要从不够好的轨迹里学（太好的没东西可反思） |
+
+> **本质区别**：4.0 是"这个轨迹能不能当成功样本学偏好"，6.0 是"这个轨迹值不值得反思提取操作规则"。一个管"偏好蒸馏的门槛"，一个管"操作规则反思的门槛"。
+
+### Q42. 9 维偏好合并：priceRange 为什么取更保守（更小）？avoidFactors 和 foodPreferences 冲突怎么处理？
+
+#### priceRange 取更保守的原因
+
+```python
+# preferences.py 合并策略
+# 新 max 与旧 max 取更小，除非用户明确说「放宽预算」
+new_max = min(old_max, new_max) if old_max else new_max
+```
+
+**场景**：用户这轮说"人均 100 以内"，上轮说"人均 150 以内"。如果取更大（150），可能推荐 120 的店用户觉得贵。取更小（100）更安全——用户预算只会越来越清晰（收窄），不会莫名放宽。
+
+**例外**：用户明确说"好一点/贵点/放宽预算"时，不取 min 而是取新值。这由 plan 节点的 LLM 在 intent_analysis 里判断，通过 MEMORY_UPDATE_PROMPT 传给 save_memory。
+
+#### avoidFactors 和 foodPreferences 冲突处理
+
+```python
+# 冲突解决：把冲突项从 foodPreferences 迁移到 avoidFactors
+# 例：foodPreferences 有"火锅"，avoidFactors 新增"不吃辣"
+# → 火锅多为辣味，从 foodPreferences 移除"火锅"
+```
+
+**为什么迁移而不是都保留？** 如果 foodPreferences 保留"火锅"而 avoidFactors 保留"不吃辣"，下次推荐时 plan 节点会矛盾：memory 说喜欢火锅但 avoidKeywords 排除辣——可能搜不到任何店。迁移后 foodPreferences 去掉火锅，避免矛盾。
+
+#### 数组字段的合并策略
+
+- **likedCategories / foodPreferences / frequentAreas**：append + 去重（SET 语义），新值追加不覆盖旧值
+- **avoidFactors**：覆盖式追加（新的 avoid 会把冲突的 foodPreferences 项迁移过来）
+- **environmentPreference**：append + 去重
+
+> **90 天过期**：lastUpdated 超 90 天，plan 时 LLM 会提示"偏好可能过时"。防止用户 3 年前的偏好还在影响当前推荐。
+
+### Q43. Chroma HNSW 为什么用 cosine 不用 L2？混合评分 0.7/0.3 怎么调的？Chroma 挂了怎么办？
+
+#### 为什么用 cosine 不用 L2
+
+- **cosine**：衡量方向相似性，不关心向量长度。Playbook 条目的 embedding 长度可能因 description 长短不同而不同，cosine 能消除长度差异
+- **L2**：衡量绝对距离，长 description 的向量模长大，会被 L2 判为"远"，不公平
+
+对于语义匹配（"这条规则和用户查询说的是不是一回事"），cosine 是标准选择。Chroma 配置 `"hnsw:space": "cosine"`。
+
+#### 混合评分 0.7/0.3 怎么调的
+
+```python
+# playbook.py get_context_rag
+sim = max(0.0, 1.0 - distances[e.entryId])  # Chroma cosine distance → 相似度
+combined = sim * 0.7 + e.confidence * 0.3
+```
+
+- **0.7 给语义相似度**：RAG 的核心是"检索相关条目"，相关性应该占主导
+- **0.3 给置信度**：置信度代表规则的历史有效性（timesHelpful/timesApplied），作为次要修正
+
+调参过程：试过 1.0/0（纯语义）、0.5/0.5、0.7/0.3、0.3/0.7。纯语义会召回"语义相关但 confidence 极低的低质量规则"；0.5/0.5 让 confidence 权重过大，退化为纯置信度排序；0.7/0.3 效果最好——相关性主导，置信度做 tiebreaker。
+
+未被检索到的条目用 `confidence * 0.15`（低权重兜底），保证它们有机会进入 Top-K 但不会挤掉更相关的条目。
+
+#### Chroma 挂了怎么办
+
+```python
+try:
+    results = await asyncio.to_thread(collection.query, ...)
+    retrieved_ids = set(results["ids"][0])
+except Exception as e:
+    logger.warning(f"Chroma query failed: {e}, fallback to confidence")
+    retrieved_ids = set()
+    distances = {}
+
+# 降级：纯置信度排序
+if retrieved_ids:
+    # 混合评分
+else:
+    scored = [(e.confidence, 0.0, e) for e in entries]  # 纯置信度
+```
+
+Chroma 不可用时降级为纯置信度排序，Agent 仍能工作（只是检索质量下降）。这是**优雅降级**原则：向量检索是增强不是必需，挂了不能让整个 Agent 不可用。
+
+### Q44. augment_summary 为什么按 trigger 长度降序匹配？不排序会出什么 bug？
+
+```python
+# playbook.py augment_summary
+triggers_sorted = sorted(by_trigger.keys(), key=len, reverse=True)
+for trigger in triggers_sorted:
+    if trigger in text:
+        ...
+```
+
+#### 不排序会出什么 bug
+
+假设 Playbook 里有两条 fuzzy_mapping：
+- trigger = "近" → normalized = "约1km内"
+- trigger = "附近" → normalized = "约5km内"
+
+如果按字典序（"近" < "附近"），先匹配"近"：用户说"附近有什么火锅"，"近"是"附近"的子串，会命中"近→约1km"，导致规范化补全是"约1km内"而不是"约5km内"——**短 trigger 抢了长 trigger 的匹配**。
+
+按长度降序：先匹配"附近"（命中），再匹配"近"（已被"附近"覆盖，可跳过或都命中但取高分）。保证最长 trigger 优先匹配，避免短前缀劫持。
+
+#### 同 trigger 多 normalized 怎么选
+
+```python
+bucket.sort(key=lambda x: x[0], reverse=True)  # 按 score 降序
+top_score, top_entry, top_parsed = bucket[0]  # 取最高分
+```
+
+score = `confidence * (1.0 + 0.1 * timesApplied)`，综合置信度和应用次数。同一 trigger 有多个 normalized（比如"便宜"→"人均80以内"和"便宜"→"人均100以内"），选历史应用次数多且置信度高的那个。
+
+### Q45. PLAN prompt 硬约束「Playbook 补全必须落到 tool_calls.params」——怎么验证 LLM 真执行了？没执行怎么办？
+
+#### 验证方式
+
+**无法 100% 验证**。LLM 可能 reasoning 里写了"按 Playbook 补全 maxPrice=120"，但 tool_calls.params 里没带 maxPrice。这是 LLM 的固有不可控性。
+
+但可以通过以下方式**提高执行率 + 事后检测**：
+
+1. **prompt 层面强约束**：PLAN_SYSTEM_PROMPT 里用「硬约束」「必须」「务必」等强语气，并给正反例
+2. **reasoning 字段要求说明**：要求 LLM 在 reasoning 里写明"依据 [Playbook 规范化补全] 做了哪些偏好注入"，强制 LLM 显式思考
+3. **示例驱动**：prompt 里给一个完整示例（用户消息 + Playbook 补全 + 正确 tool_calls 输出），让 LLM 模仿
+4. **事后检测**：execute_node 执行前可以校验 tool_calls.params 是否包含 Playbook 补全的参数（当前未实现，是改进方向）
+
+#### 没执行怎么办
+
+- **兜底 1**：generate 节点会从 intent_analysis 提取 maxPrice/minScore/avoidKeywords 做 client-side 硬过滤，即使 plan 没传 maxPrice 给搜索工具，generate 阶段也会过滤掉超价的候选
+- **兜底 2**：memory.priceRange.max 也会注入 PLAN prompt，LLM 即使忽略 Playbook 补全，也可能从 memory 里读到偏好
+- **兜底 3**：replan_relax 的规则放宽会兜底候选不足的场景
+
+> **设计哲学**：不依赖 LLM 100% 执行硬约束，而是用多层兜底保证即使 LLM 没执行，最终推荐质量也不会崩。Playbook 补全是"锦上添花"，不是"唯一防线"。
+
+---
+
+## 六、深度追问：后端工程细节
+
+### Q46. @Lazy 打破循环依赖：CGLIB 代理原理？为什么不重构掉循环依赖？
+
+#### 循环依赖的产生
+
+```
+VoucherOrderServiceImpl 依赖 IPaymentService（payOrder 委托给支付服务）
+PaymentServiceImpl 依赖 VoucherOrderServiceImpl（退款时要恢复订单）
+```
+
+#### @Lazy 的 CGLIB 代理原理
+
+`@Lazy` 注入的不是真实对象，而是 Spring 在运行时生成的 CGLIB 代理：
+
+1. Spring 启动时发现 `VoucherOrderServiceImpl` 依赖 `IPaymentService`，但 `PaymentServiceImpl` 还没创建（循环了）
+2. `@Lazy` 让 Spring 先注入一个 CGLIB 代理对象（不触发真实 Bean 创建）
+3. 第一次调用 `paymentService.payOrder()` 时，代理才从容器中获取真实的 `PaymentServiceImpl` Bean 并委托调用
+4. 此时 `PaymentServiceImpl` 已经创建完毕（它依赖的 `VoucherOrderServiceImpl` 已注册），循环打破
+
+#### 为什么不重构掉循环依赖？
+
+理想情况应该重构，但本项目的循环依赖有业务合理性：
+
+- **VoucherOrderService** 是订单领域的门面，对外暴露 `payOrder` 入口（门面模式）
+- **PaymentService** 是支付领域，退款时需要操作订单（恢复状态、恢复库存）
+
+两者确实需要互相调用。重构方案是引入第三层（如 `OrderPaymentFacade`），但增加一层抽象对学习项目收益不大。`@Lazy` 是 Spring 官方推荐的循环依赖解决方案（配合 `spring.main.allow-circular-references=true`），安全且零侵入。
+
+> **Spring Boot 2.6+ 默认禁用循环依赖**，需要显式开启。本项目用 `@Lazy` 是更优雅的方式，不依赖全局配置。
+
+### Q47. CacheClient 逻辑过期方案缺 Double Check，具体什么风险？怎么补？
+
+#### 缺 Double Check 的风险
+
+```java
+// 当前实现（简化）
+if (isLock) {
+    // 拿到锁后直接重建，没有二次检查缓存
+    CACHE_REBUILD_EXECUTOR.submit(() -> {
+        R r1 = dbFallback.apply(id);
+        this.setWithLogicalExpire(key, r1, time, unit);
+    });
+}
+```
+
+**风险场景**：
+1. 线程 A 发现缓存过期，获取锁成功，开始重建（查 DB 需 200ms）
+2. 线程 A 重建期间，缓存仍是旧值（过期数据），其他线程返回旧值 ✓
+3. 线程 A 重建完成，写回新值，释放锁
+4. 线程 B 在线程 A 释放锁后获取锁，**没有检查缓存已被 A 重建**，又查一次 DB 重建——**重复重建，浪费 DB 查询**
+
+#### 怎么补
+
+```java
+if (isLock) {
+    // Double Check：拿锁后再查一次缓存，可能已被别的线程重建
+    json = stringRedisTemplate.opsForValue().get(key);
+    RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+    if (redisData.getExpireTime().isAfter(LocalDateTime.now())) {
+        // 已被重建，直接返回，不再查 DB
+        return JSONUtil.toBean((JSONObject) redisData.getData(), type);
+    }
+    // 确实还需要重建
+    CACHE_REBUILD_EXECUTOR.submit(() -> { ... });
+}
+```
+
+#### 影响评估
+
+当前不补的风险是**偶发重复 DB 查询**（概率低：需要两个线程先后拿锁且都不检查）。对学习项目影响不大，但面试时被问到要能说出这个缺陷和补法。
+
+> **代码里已注释说明**：`// 本代码里没有做二次检查，其实是可以优化的点`。这种主动标注已知缺陷比假装完美更好。
+
+### Q48. ES rebuild-index 接口并发调用会怎样？怎么保证幂等/安全？
+
+#### 并发调用的风险
+
+`rebuildIndexInternal(force=true)` 执行 DROP → CREATE → PUT MAPPING → IMPORT 四步：
+
+1. **DROP 不是原子的**：线程 A DROP 后还没 CREATE，线程 B 也来 DROP（索引已不存在，报错）或 CREATE（冲突）
+2. **IMPORT 重复**：两个线程都 IMPORT 全量数据，ES 会 upsert（按 _id 覆盖），数据不会翻倍但浪费 IO
+3. **查询空窗**：DROP 到 IMPORT 完成期间，所有搜索查不到数据（或走熔断器降级 MySQL）
+
+#### 当前如何保证安全
+
+**当前没有加锁**，靠两点保证：
+
+1. **管理接口需登录**：`POST /shop/search/rebuild-index` 需登录态，不是公开接口，不会被恶意刷
+2. **运维约定**：同义词更新是低频操作（改 synonyms.txt 后手动调一次），不会并发
+
+#### 生产环境应该怎么做
+
+```java
+// 方案 1：Redis 分布式锁
+RLock lock = redissonClient.getLock("lock:es:rebuild");
+if (!lock.tryLock(0, 600, TimeUnit.SECONDS)) {
+    return Result.fail("索引重建正在进行中，请稍后");
+}
+try {
+    rebuildIndexInternal(true);
+} finally {
+    lock.unlock();
+}
+
+// 方案 2：别名零停机重建（推荐）
+// 1. CREATE shop_v2 (新索引，新同义词)
+// 2. IMPORT 全量数据到 shop_v2
+// 3. POST /_aliases 把 shop 别名从 shop_v1 切到 shop_v2
+// 4. DELETE shop_v1
+// 优点：零查询空窗，可回滚（切回 shop_v1）
+```
+
+> **方案 2（别名切换）是 ES 索引重建的最佳实践**，但实现复杂。本项目用方案 DROP+CREATE 足够学习场景，面试时要能说出方案 2。
+
+### Q49. @CircuitBreaker HALF_OPEN 只放 1 个探针，探针超时（不是抛异常）怎么处理？
+
+#### 当前实现对超时的处理
+
+**当前实现只捕获 Throwable**：
+
+```java
+try {
+    Object result = joinPoint.proceed();  // 探针请求
+    // 成功 → CLOSED
+} catch (Throwable e) {
+    // 失败 → 重新 OPEN
+}
+```
+
+如果探针请求**超时**（比如 ES 响应慢，HTTP 调用 30s 没返回），`joinPoint.proceed()` 会抛 `SocketTimeoutException`，被 catch 捕获 → 探测失败 → 重新 OPEN。
+
+**所以超时被当作失败处理**，这是正确的——超时说明服务还没恢复，不应该转 CLOSED。
+
+#### 探针超时的潜在问题
+
+1. **HALF_OPEN 阻塞**：探针请求一直不返回（比如 ES 假死），HALF_OPEN 状态会一直持续到超时
+2. **其他请求被降级**：HALF_OPEN 期间 `probeSent=true`，其他请求都走 fallback，直到探针完成
+
+#### 优化方向
+
+- **给探针加独立超时**：比如 ES 正常请求超时 5s，探针超时设 2s（更短），快速判断服务是否恢复
+- **HALF_OPEN 加超时**：如果探针 10s 没返回，强制重新 OPEN，不要一直卡在 HALF_OPEN
+- **放多个探针**：当前只放 1 个，可以放 3 个，2/3 成功就转 CLOSED（更鲁棒，但实现复杂）
+
+#### 为什么只用 CAS 不用 synchronized
+
+```java
+if (!breaker.getProbeSent().compareAndSet(false, true)) {
+    return doFallback(joinPoint, circuitBreaker);  // 其他请求降级
+}
+```
+
+- **CAS 无锁**：`AtomicBoolean.compareAndSet` 是无锁操作，性能高于 synchronized
+- **保证唯一性**：CAS 保证只有一个线程能把 probeSent 从 false 改成 true，即只放行 1 个探针
+- **状态转换也用 CAS**：`breaker.getState().compareAndSet(BreakerState.OPEN, BreakerState.HALF_OPEN)` 保证 OPEN→HALF_OPEN 只发生一次
+
+> **synchronized 的问题**：高并发下 synchronized 会阻塞其他线程，而 CAS 是非阻塞的（失败的线程直接返回 fallback）。熔断器是高频路径，不能用阻塞锁。
+
+### Q50. 秒杀 Lua 脚本用 SADD userId 到 Set，10 万并发下 Set 内存？为什么不用 BitMap/布隆过滤器？
+
+#### Set 内存分析
+
+10 万用户秒杀，Set 存 10 万个 userId（字符串）：
+
+- 每个 userId 字符串约 10 字节（如 "10101234"）+ Redis 对象 overhead 约 50-80 字节
+- 10 万元素 ≈ 5-8 MB
+
+**Redis 单实例通常配几 GB 内存，8 MB 微不足道**。而且秒杀结束后可以 `DEL seckill:order:{voucherId}` 释放。
+
+#### 为什么不用 BitMap？
+
+- **BitMap 需要连续整数 ID**：userId 必须是 1~N 连续整数才能用 BitMap（第 N 位表示用户 N）。但本项目 userId 是 RedisIdWorker 生成的（时间戳+序列号），不是连续的
+- **BitMap 适合稀疏签到**：签到场景每天 1 位，10 万用户 30 天 = 30 万位 = 37.5 KB。秒杀场景是单次记录，Set 更自然
+
+#### 为什么不用布隆过滤器？
+
+- **布隆过滤器有误判**：布隆过滤器说"存在"可能不存在（false positive），导致合法用户被误判为"已下单"无法下单。秒杀场景宁可超卖不可误杀合法用户（业务上超卖可人工补偿，误杀合法用户影响口碑）
+- **Set 精确**：SISMEMBER 100% 精确，没误判
+- **Set 支持 SREM**：取消订单时要删除一人一单记录（`SREM seckill:order:{voucherId} userId`），布隆过滤器不支持删除
+
+#### 什么时候该换布隆过滤器
+
+- **千万级用户 + 多场秒杀同时进行**：100 个秒杀 × 1000 万用户 = 10 亿元素，Set 占 50-80 GB，布隆过滤器只需 ~1 GB
+- **能容忍误判**：如果是营销活动（不是核心交易），误判几个用户可接受
+
+> **本项目 10 万量级 Set 完全够用**。布隆过滤器是"空间优化"手段，不是"功能升级"，在空间不是瓶颈时引入只会增加复杂度。

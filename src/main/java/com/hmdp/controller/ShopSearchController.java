@@ -93,4 +93,25 @@ public class ShopSearchController {
     public Result importShop(@RequestBody Shop shop) {
         return shopSearchService.importShop(shop);
     }
+
+    /**
+     * 重建 ES shop 索引（DROP + CREATE + PUT MAPPING + MySQL 全量导入）。
+     *
+     * 【典型使用时机】
+     * 1. 修改 classpath:synonyms.txt（同义词表）后，需要让 synonym_graph filter 立即生效
+     * 2. 调整 analyzer / mapping 后需要重建
+     * 3. ES 索引损坏或 mapping 未写入时的一键修复
+     *
+     * 与重启 rebuild-on-startup=true 的区别：本接口可在服务运行期间随时调用，无需重启。
+     * 【八股：为什么要 DROP 再重建？】
+     *   · ES 的 index settings（analysis.filter/analyzer 部分）是「不可变」的——索引创建后，
+     *     不能直接 PUT _settings 修改 analysis，必须 close → update → open；更稳妥且简单的方式
+     *     （尤其项目数据量 <1000）就是 DROP + 重建 + MySQL 重导，一次解决所有 setting/mapping/sync 问题。
+     *
+     * @return 重建摘要（indexExistedBefore / dropped / created / mappingApplied / importedShops / tookMs 等）
+     */
+    @PostMapping("/rebuild-index")
+    public Result rebuildIndex() {
+        return shopSearchService.rebuildIndex();
+    }
 }

@@ -9,6 +9,7 @@ import com.hmdp.entity.Shop;
 import com.hmdp.repository.ShopDocRepository;
 import com.hmdp.service.IShopService;
 import com.hmdp.annotation.CircuitBreaker;
+import com.hmdp.config.ElasticsearchConfiguration;
 import com.hmdp.service.IShopSearchService;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
@@ -101,6 +102,27 @@ public class ShopSearchServiceImpl implements IShopSearchService {
      */
     @Resource
     private StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * ES 索引初始化配置 —— 用于 rebuildIndex 管理接口复用 DROP+CREATE+MAPPING+IMPORT 主流程
+     */
+    @Resource
+    private ElasticsearchConfiguration elasticsearchConfiguration;
+
+    @Override
+    public Result rebuildIndex() {
+        try {
+            long start = System.currentTimeMillis();
+            java.util.Map<String, Object> summary = elasticsearchConfiguration.rebuildIndexInternal(true);
+            long took = System.currentTimeMillis() - start;
+            summary.put("tookMs", took);
+            log.info("[ES] rebuildIndex 管理接口执行完成: {}", summary);
+            return Result.ok(summary);
+        } catch (Exception e) {
+            log.error("[ES] rebuildIndex 失败: {}", e.getMessage(), e);
+            return Result.fail("重建ES索引失败: " + e.getMessage());
+        }
+    }
 
     /**
      * 全文搜索商铺
@@ -219,7 +241,13 @@ public class ShopSearchServiceImpl implements IShopSearchService {
         // 2.1 must：多字段全文搜索（参与评分，按相关度排序）
         if (StrUtil.isNotBlank(keyword)) {
             // multi_match：在name、area、address、tags四个字段中搜索关键词
-            boolQuery.must(QueryBuilders.multiMatchQuery(keyword, "name", "area", "address", "tags"));
+            // 字段加权：name权重最高（用户搜"海底捞"应优先返回店名匹配），tags/area次之
+            // 【重要】四字段 mapping.search_analyzer 已统一配置为 shop_search_synonym（ik_smart + 同义词扩展）
+            //   例：用户搜"日料"会自动扩展为 "日料 OR 日本料理 OR 日式 OR 寿司 OR 刺身 OR 居酒屋"
+            //   因此这里无需在 multiMatchQuery 中再显式指定 analyzer
+            boolQuery.must(QueryBuilders.multiMatchQuery(keyword,
+                    "name^3", "tags^2", "area^1.5", "address")
+                    .type("most_fields"));
         } else {
             // 关键词为空时匹配所有文档
             boolQuery.must(QueryBuilders.matchAllQuery());
