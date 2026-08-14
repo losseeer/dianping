@@ -10,6 +10,7 @@ import com.hmdp.service.IUserService;
 import lombok.Builder;
 import lombok.SneakyThrows;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -32,6 +33,7 @@ import java.util.stream.Collectors;
 
 @SpringBootTest
 @AutoConfigureMockMvc
+@Disabled("Manual load-data generator; requires local MySQL and Redis")
 class VoucherOrderControllerTest {
 
     @Resource
@@ -79,9 +81,10 @@ class VoucherOrderControllerTest {
                     Assert.isTrue(result.getSuccess(), String.format("获取“%s”手机号的token失败,json为“%s”", phone, json));
                     String token = result.getData().toString();
                     tokenList.add(token);
-                    countDownLatch.countDown();
                 } catch (Exception e) {
                     e.printStackTrace();
+                } finally {
+                    countDownLatch.countDown();
                 }
             });
         });

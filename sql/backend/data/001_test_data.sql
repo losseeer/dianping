@@ -657,53 +657,58 @@ INSERT INTO `tb_user_info` VALUES (100, '成都', '美食探店博主', 417, 166
 -- 9. tb_voucher_order 优惠券订单
 -- ===========================================================
 
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000001, 182, 2, 1, 3, '2026-07-20 18:24:17', '2026-07-20 18:24:17', '2026-07-29 18:24:17', NULL, '2026-07-20 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000002, 753, 3, 1, 3, '2026-07-12 18:24:17', '2026-07-12 18:24:17', '2026-07-30 18:24:17', NULL, '2026-07-12 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000003, 334, 4, 1, 3, '2026-07-22 18:24:17', '2026-07-22 18:24:17', '2026-07-28 18:24:17', NULL, '2026-07-22 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000004, 374, 5, 1, 2, '2026-07-01 18:24:17', '2026-07-01 18:24:17', NULL, NULL, '2026-07-01 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000005, 578, 6, 1, 2, '2026-07-12 18:24:17', '2026-07-12 18:24:17', NULL, NULL, '2026-07-12 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000006, 559, 7, 1, 2, '2026-07-09 18:24:17', '2026-07-09 18:24:17', NULL, NULL, '2026-07-09 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000007, 787, 8, 1, 2, '2026-07-07 18:24:17', '2026-07-07 18:24:17', NULL, NULL, '2026-07-07 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000008, 473, 9, 1, 2, '2026-07-16 18:24:17', '2026-07-16 18:24:17', NULL, NULL, '2026-07-16 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000009, 817, 10, 1, 3, '2026-07-04 18:24:17', '2026-07-04 18:24:17', '2026-07-26 18:24:17', NULL, '2026-07-04 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000010, 71, 11, 1, 3, '2026-07-09 18:24:17', '2026-07-09 18:24:17', '2026-07-28 18:24:17', NULL, '2026-07-09 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000011, 143, 32, 3, 2, '2026-07-31 03:24:17', '2026-07-31 10:24:17', NULL, NULL, '2026-07-31 03:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000012, 158, 32, 3, 3, '2026-07-30 18:24:17', '2026-07-31 16:24:17', '2026-07-31 11:24:17', NULL, '2026-07-30 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000013, 491, 32, 2, 3, '2026-07-30 08:24:17', '2026-07-31 02:24:17', '2026-07-31 07:24:17', NULL, '2026-07-30 08:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000014, 557, 32, 3, 1, '2026-07-30 19:24:17', NULL, NULL, NULL, '2026-07-30 19:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000015, 917, 32, 1, 1, '2026-07-31 12:24:17', NULL, NULL, NULL, '2026-07-31 12:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000016, 674, 33, 3, 2, '2026-07-31 08:24:17', '2026-07-30 22:24:17', NULL, NULL, '2026-07-31 08:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000017, 46, 33, 2, 3, '2026-07-29 18:24:17', '2026-07-31 08:24:17', '2026-07-31 06:24:17', NULL, '2026-07-29 18:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000018, 109, 33, 2, 1, '2026-07-31 12:24:17', NULL, NULL, NULL, '2026-07-31 12:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000019, 228, 33, 2, 2, '2026-07-30 14:24:17', '2026-07-31 07:24:17', NULL, NULL, '2026-07-30 14:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000020, 475, 33, 2, 2, '2026-07-30 20:24:17', '2026-07-31 18:24:17', NULL, NULL, '2026-07-30 20:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000021, 108, 34, 1, 2, '2026-07-30 16:24:17', '2026-07-31 16:24:17', NULL, NULL, '2026-07-30 16:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000022, 852, 34, 2, 2, '2026-07-30 20:24:17', '2026-07-31 09:24:17', NULL, NULL, '2026-07-30 20:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000023, 467, 34, 2, 2, '2026-07-30 09:24:17', '2026-07-31 03:24:17', NULL, NULL, '2026-07-30 09:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000024, 488, 34, 3, 1, '2026-07-30 14:24:17', NULL, NULL, NULL, '2026-07-30 14:24:17');
-INSERT INTO `tb_voucher_order` VALUES (1700000000000000025, 714, 34, 1, 3, '2026-07-30 22:24:17', '2026-07-31 16:24:17', '2026-07-31 14:24:17', NULL, '2026-07-30 22:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000001, 182, 2, 1, 3, '2026-07-20 18:24:17', '2026-07-20 18:24:17', '2026-07-29 18:24:17', NULL, '2026-07-20 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000002, 753, 3, 1, 3, '2026-07-12 18:24:17', '2026-07-12 18:24:17', '2026-07-30 18:24:17', NULL, '2026-07-12 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000003, 334, 4, 1, 3, '2026-07-22 18:24:17', '2026-07-22 18:24:17', '2026-07-28 18:24:17', NULL, '2026-07-22 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000004, 374, 5, 1, 2, '2026-07-01 18:24:17', '2026-07-01 18:24:17', NULL, NULL, '2026-07-01 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000005, 578, 6, 1, 2, '2026-07-12 18:24:17', '2026-07-12 18:24:17', NULL, NULL, '2026-07-12 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000006, 559, 7, 1, 2, '2026-07-09 18:24:17', '2026-07-09 18:24:17', NULL, NULL, '2026-07-09 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000007, 787, 8, 1, 2, '2026-07-07 18:24:17', '2026-07-07 18:24:17', NULL, NULL, '2026-07-07 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000008, 473, 9, 1, 2, '2026-07-16 18:24:17', '2026-07-16 18:24:17', NULL, NULL, '2026-07-16 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000009, 817, 10, 1, 3, '2026-07-04 18:24:17', '2026-07-04 18:24:17', '2026-07-26 18:24:17', NULL, '2026-07-04 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000010, 71, 11, 1, 3, '2026-07-09 18:24:17', '2026-07-09 18:24:17', '2026-07-28 18:24:17', NULL, '2026-07-09 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000011, 143, 32, 3, 2, '2026-07-31 03:24:17', '2026-07-31 10:24:17', NULL, NULL, '2026-07-31 03:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000012, 158, 32, 3, 3, '2026-07-30 18:24:17', '2026-07-31 16:24:17', '2026-07-31 11:24:17', NULL, '2026-07-30 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000013, 491, 32, 2, 3, '2026-07-30 08:24:17', '2026-07-31 02:24:17', '2026-07-31 07:24:17', NULL, '2026-07-30 08:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000014, 557, 32, 3, 1, '2026-07-30 19:24:17', NULL, NULL, NULL, '2026-07-30 19:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000015, 917, 32, 1, 1, '2026-07-31 12:24:17', NULL, NULL, NULL, '2026-07-31 12:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000016, 674, 33, 3, 2, '2026-07-31 08:24:17', '2026-07-30 22:24:17', NULL, NULL, '2026-07-31 08:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000017, 46, 33, 2, 3, '2026-07-29 18:24:17', '2026-07-31 08:24:17', '2026-07-31 06:24:17', NULL, '2026-07-29 18:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000018, 109, 33, 2, 1, '2026-07-31 12:24:17', NULL, NULL, NULL, '2026-07-31 12:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000019, 228, 33, 2, 2, '2026-07-30 14:24:17', '2026-07-31 07:24:17', NULL, NULL, '2026-07-30 14:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000020, 475, 33, 2, 2, '2026-07-30 20:24:17', '2026-07-31 18:24:17', NULL, NULL, '2026-07-30 20:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000021, 108, 34, 1, 2, '2026-07-30 16:24:17', '2026-07-31 16:24:17', NULL, NULL, '2026-07-30 16:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000022, 852, 34, 2, 2, '2026-07-30 20:24:17', '2026-07-31 09:24:17', NULL, NULL, '2026-07-30 20:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000023, 467, 34, 2, 2, '2026-07-30 09:24:17', '2026-07-31 03:24:17', NULL, NULL, '2026-07-30 09:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000024, 488, 34, 3, 1, '2026-07-30 14:24:17', NULL, NULL, NULL, '2026-07-30 14:24:17');
+INSERT INTO `tb_voucher_order` (`id`,`user_id`,`voucher_id`,`pay_type`,`status`,`create_time`,`pay_time`,`use_time`,`refund_time`,`update_time`) VALUES (1700000000000000025, 714, 34, 1, 3, '2026-07-30 22:24:17', '2026-07-31 16:24:17', '2026-07-31 14:24:17', NULL, '2026-07-30 22:24:17');
 
 -- 共新增 25 条订单
+
+UPDATE `tb_voucher_order` o
+JOIN `tb_voucher` v ON v.id = o.voucher_id
+SET o.amount = v.pay_value
+WHERE o.amount IS NULL;
 
 -- ===========================================================
 -- 10. tb_pay_log 支付流水
 -- ===========================================================
 
-INSERT INTO `tb_pay_log` VALUES (1, 1700000000000000001, 830, 3, '4200125426700679782', 5000, 2, '2026-07-26 18:24:17', '2026-07-26 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (2, 1700000000000000002, 953, 3, '4200680955503924275', 9500, 2, '2026-07-21 18:24:17', '2026-07-21 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (3, 1700000000000000003, 574, 2, '4200620227735326317', 9500, 4, '2026-07-11 18:24:17', '2026-07-11 18:24:17', '2026-07-30 18:24:17');
-INSERT INTO `tb_pay_log` VALUES (4, 1700000000000000004, 191, 3, '4200586541013374147', 10000, 2, '2026-07-12 18:24:17', '2026-07-12 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (5, 1700000000000000005, 905, 1, '4200766761243875610', 10000, 4, '2026-07-31 18:24:17', '2026-07-31 18:24:17', '2026-07-26 18:24:17');
-INSERT INTO `tb_pay_log` VALUES (6, 1700000000000000006, 220, 1, '4200947041760697160', 4750, 2, '2026-07-14 18:24:17', '2026-07-14 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (7, 1700000000000000007, 192, 2, '4200321883705573197', 10000, 2, '2026-07-23 18:24:17', '2026-07-23 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (8, 1700000000000000008, 687, 2, '4200452864373087942', 2500, 4, '2026-07-12 18:24:17', '2026-07-12 18:24:17', '2026-07-28 18:24:17');
-INSERT INTO `tb_pay_log` VALUES (9, 1700000000000000009, 602, 1, '4200496298126726876', 10000, 2, '2026-07-22 18:24:17', '2026-07-22 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (10, 1700000000000000010, 941, 3, '4200195423823169075', 9500, 2, '2026-07-28 18:24:17', '2026-07-28 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (11, 1700000000000000011, 245, 2, '4200306090213023000', 5000, 2, '2026-07-15 18:24:17', '2026-07-15 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (12, 1700000000000000012, 398, 2, '4200255226974674122', 2500, 4, '2026-07-18 18:24:17', '2026-07-18 18:24:17', '2026-07-30 18:24:17');
-INSERT INTO `tb_pay_log` VALUES (13, 1700000000000000013, 499, 3, '4200880737168125978', 9500, 2, '2026-07-16 18:24:17', '2026-07-16 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (14, 1700000000000000014, 296, 1, '4200454185281646912', 10000, 2, '2026-07-20 18:24:17', '2026-07-20 18:24:17', NULL);
-INSERT INTO `tb_pay_log` VALUES (15, 1700000000000000015, 975, 1, '4200253723255870621', 9500, 4, '2026-07-14 18:24:17', '2026-07-14 18:24:17', '2026-07-27 18:24:17');
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (1, 1700000000000000001, 830, 3, '4200125426700679782', 5000, 2, NULL, '2026-07-26 18:24:17', '2026-07-26 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (2, 1700000000000000002, 953, 3, '4200680955503924275', 9500, 2, NULL, '2026-07-21 18:24:17', '2026-07-21 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (3, 1700000000000000003, 574, 2, '4200620227735326317', 9500, 4, NULL, '2026-07-11 18:24:17', '2026-07-11 18:24:17', '2026-07-30 18:24:17');
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (4, 1700000000000000004, 191, 3, '4200586541013374147', 10000, 2, NULL, '2026-07-12 18:24:17', '2026-07-12 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (5, 1700000000000000005, 905, 1, '4200766761243875610', 10000, 4, NULL, '2026-07-31 18:24:17', '2026-07-31 18:24:17', '2026-07-26 18:24:17');
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (6, 1700000000000000006, 220, 1, '4200947041760697160', 4750, 2, NULL, '2026-07-14 18:24:17', '2026-07-14 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (7, 1700000000000000007, 192, 2, '4200321883705573197', 10000, 2, NULL, '2026-07-23 18:24:17', '2026-07-23 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (8, 1700000000000000008, 687, 2, '4200452864373087942', 2500, 4, NULL, '2026-07-12 18:24:17', '2026-07-12 18:24:17', '2026-07-28 18:24:17');
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (9, 1700000000000000009, 602, 1, '4200496298126726876', 10000, 2, NULL, '2026-07-22 18:24:17', '2026-07-22 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (10, 1700000000000000010, 941, 3, '4200195423823169075', 9500, 2, NULL, '2026-07-28 18:24:17', '2026-07-28 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (11, 1700000000000000011, 245, 2, '4200306090213023000', 5000, 2, NULL, '2026-07-15 18:24:17', '2026-07-15 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (12, 1700000000000000012, 398, 2, '4200255226974674122', 2500, 4, NULL, '2026-07-18 18:24:17', '2026-07-18 18:24:17', '2026-07-30 18:24:17');
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (13, 1700000000000000013, 499, 3, '4200880737168125978', 9500, 2, NULL, '2026-07-16 18:24:17', '2026-07-16 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (14, 1700000000000000014, 296, 1, '4200454185281646912', 10000, 2, NULL, '2026-07-20 18:24:17', '2026-07-20 18:24:17', NULL);
+INSERT INTO `tb_pay_log` (`id`,`order_id`,`user_id`,`pay_type`,`trade_no`,`amount`,`status`,`pending_flag`,`create_time`,`pay_time`,`refund_time`) VALUES (15, 1700000000000000015, 975, 1, '4200253723255870621', 9500, 4, NULL, '2026-07-14 18:24:17', '2026-07-14 18:24:17', '2026-07-27 18:24:17');
 
 -- 共新增 15 条支付流水
 

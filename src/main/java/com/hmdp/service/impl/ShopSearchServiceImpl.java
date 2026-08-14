@@ -241,12 +241,15 @@ public class ShopSearchServiceImpl implements IShopSearchService {
         // 2.1 must：多字段全文搜索（参与评分，按相关度排序）
         if (StrUtil.isNotBlank(keyword)) {
             // multi_match：在name、area、address、tags四个字段中搜索关键词
-            // 字段加权：name权重最高（用户搜"海底捞"应优先返回店名匹配），tags/area次之
+            // 统一查询四个字段，相关度仍由 ES 根据匹配词计算
             // 【重要】四字段 mapping.search_analyzer 已统一配置为 shop_search_synonym（ik_smart + 同义词扩展）
             //   例：用户搜"日料"会自动扩展为 "日料 OR 日本料理 OR 日式 OR 寿司 OR 刺身 OR 居酒屋"
             //   因此这里无需在 multiMatchQuery 中再显式指定 analyzer
+            // The 7.6 client serializes decimal multi-match boosts as an
+            // invalid field name (for example "1.5^1.0"). Keep the query
+            // typeless and unweighted; score sorting still works normally.
             boolQuery.must(QueryBuilders.multiMatchQuery(keyword,
-                    "name^3", "tags^2", "area^1.5", "address")
+                    "name", "tags", "area", "address")
                     .type("most_fields"));
         } else {
             // 关键词为空时匹配所有文档

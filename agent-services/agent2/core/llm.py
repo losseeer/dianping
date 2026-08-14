@@ -4,12 +4,14 @@ import logging
 import os as _os
 import random
 import time
+import uuid
 from typing import Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import BaseMessage
 
 from core.config import config
+from core.observability import workflow_event
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +208,19 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
     max_attempts = _LLM_MAX_RETRIES
     last_err: Exception | None = None
     response = None
+    call_id = str(uuid.uuid4())
+    message_payload = [
+        {"type": getattr(message, "type", type(message).__name__), "content": message.content}
+        for message in messages
+    ]
+    started = time.perf_counter()
+    workflow_event(
+        "llm.started",
+        callId=call_id,
+        model=config.LLM_MODEL,
+        messageCount=len(messages),
+        messages=message_payload,
+    )
 
     for attempt in range(1, max_attempts + 1):
         # ① 令牌桶限流（RPM=0 时直通）
@@ -214,9 +229,24 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
         except LLMBusyError:
             if attempt == max_attempts:
                 logger.warning(f"call_llm 令牌桶耗尽，放弃 (attempt={attempt})")
+                workflow_event(
+                    "llm.busy",
+                    level=logging.WARNING,
+                    callId=call_id,
+                    attempt=attempt,
+                    reason="rate_limit_queue_timeout",
+                )
                 raise
             delay = _backoff_delay(attempt)
             logger.warning(f"call_llm 令牌桶排队超时，{delay:.1f}s 后重试 (attempt={attempt}/{max_attempts})")
+            workflow_event(
+                "llm.retry_scheduled",
+                level=logging.WARNING,
+                callId=call_id,
+                attempt=attempt,
+                reason="rate_limit_queue_timeout",
+                delayMs=round(delay * 1000, 1),
+            )
             await _asyncio.sleep(delay)
             continue
 
@@ -224,6 +254,13 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
         try:
             await _asyncio.wait_for(sem.acquire(), timeout=_LLM_QUEUE_TIMEOUT)
         except _asyncio.TimeoutError:
+            workflow_event(
+                "llm.busy",
+                level=logging.WARNING,
+                callId=call_id,
+                attempt=attempt,
+                reason="concurrency_queue_timeout",
+            )
             raise LLMBusyError(
                 f"并发槽位已满 (max={_LLM_MAX_CONCURRENCY})，排队 {_LLM_QUEUE_TIMEOUT:.0f}s 超时"
             )
@@ -238,9 +275,27 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
             status = getattr(e, "status_code", None)
             # 非限流/服务端错误：不重试，直接抛
             if status not in (429, 500, 502, 503, 504):
+                workflow_event(
+                    "llm.failed",
+                    level=logging.ERROR,
+                    callId=call_id,
+                    attempt=attempt,
+                    statusCode=status,
+                    errorType=type(e).__name__,
+                    error=str(e),
+                )
                 raise
             if attempt == max_attempts:
                 logger.warning(f"call_llm 放弃重试 (attempt={attempt}, status={status}): {e}")
+                workflow_event(
+                    "llm.failed",
+                    level=logging.ERROR,
+                    callId=call_id,
+                    attempt=attempt,
+                    statusCode=status,
+                    errorType=type(e).__name__,
+                    error=str(e),
+                )
                 raise
             # ④ 退避：优先 Retry-After，否则指数退避 + jitter
             retry_after = _extract_retry_after(e)
@@ -250,14 +305,40 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
                 f"(attempt={attempt}/{max_attempts})"
                 + (f" [Retry-After={retry_after}]" if retry_after else "")
             )
+            workflow_event(
+                "llm.retry_scheduled",
+                level=logging.WARNING,
+                callId=call_id,
+                attempt=attempt,
+                statusCode=status,
+                reason="retryable_api_error",
+                delayMs=round(delay * 1000, 1),
+            )
             await _asyncio.sleep(delay)
 
         except Exception as e:
             last_err = e
             if attempt == max_attempts:
+                workflow_event(
+                    "llm.failed",
+                    level=logging.ERROR,
+                    callId=call_id,
+                    attempt=attempt,
+                    errorType=type(e).__name__,
+                    error=str(e),
+                )
                 raise
             delay = _backoff_delay(attempt)
             logger.warning(f"call_llm 异常: {e}, {delay:.1f}s 后重试 (attempt={attempt}/{max_attempts})")
+            workflow_event(
+                "llm.retry_scheduled",
+                level=logging.WARNING,
+                callId=call_id,
+                attempt=attempt,
+                reason="unexpected_error",
+                delayMs=round(delay * 1000, 1),
+                errorType=type(e).__name__,
+            )
             await _asyncio.sleep(delay)
 
         finally:
@@ -286,6 +367,15 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
                 )
     except Exception as e:
         logger.warning(f"Failed to extract token usage: {e}")
+
+    workflow_event(
+        "llm.completed",
+        callId=call_id,
+        attempt=attempt,
+        durationMs=round((time.perf_counter() - started) * 1000, 1),
+        tokenUsage=get_token_usage(),
+        response=getattr(response, "content", ""),
+    )
 
     return response
 

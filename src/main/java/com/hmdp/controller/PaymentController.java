@@ -5,6 +5,7 @@ import com.hmdp.dto.PaymentDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.service.IPaymentService;
 import com.hmdp.service.IVoucherOrderService;
+import com.hmdp.utils.PaymentCallbackVerifier;
 import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
@@ -22,7 +23,7 @@ import javax.annotation.Resource;
  * 第三方回调接口需要验证签名，防止伪造请求
  * 微信回调：验证签名 + 验证金额 + 验证订单号
  * 支付宝回调：验证签名 + 验证app_id
- * 这里是模拟环境，省略签名验证
+ * 本地模拟回调也必须使用共享密钥生成HMAC签名。
  *
  * 【八股：回调接口需要排除登录拦截器】
  * 第三方支付平台调用回调时不会携带用户的登录Token
@@ -38,6 +39,9 @@ public class PaymentController {
 
     @Resource
     private IPaymentService paymentService;
+
+    @Resource
+    private PaymentCallbackVerifier callbackVerifier;
 
     /**
      * 发起支付
@@ -58,6 +62,9 @@ public class PaymentController {
     @PostMapping
     @RateLimit(qps = 20, message = "支付操作过于频繁，请稍后再试")
     public Result pay(@RequestBody PaymentDTO dto) {
+        if (dto == null) {
+            return Result.fail("支付参数不能为空");
+        }
         return voucherOrderService.payOrder(dto.getOrderId(), dto.getPayType());
     }
 
@@ -80,8 +87,13 @@ public class PaymentController {
      */
     @PostMapping("/notify")
     public Result payNotify(@RequestParam String tradeNo,
-                            @RequestParam Long orderId) {
-        return paymentService.handlePayNotify(tradeNo, orderId);
+                            @RequestParam Long orderId,
+                            @RequestParam Long amount,
+                            @RequestHeader(value = "X-Payment-Signature", required = false) String signature) {
+        if (!callbackVerifier.verifyPay(signature, tradeNo, orderId, amount)) {
+            return Result.fail("支付回调签名无效");
+        }
+        return paymentService.handlePayNotify(tradeNo, orderId, amount);
     }
 
     /**
@@ -109,7 +121,12 @@ public class PaymentController {
      */
     @PostMapping("/refund/callback")
     public Result refundCallback(@RequestParam String tradeNo,
-                                 @RequestParam Long orderId) {
-        return paymentService.handleRefund(tradeNo, orderId);
+                                 @RequestParam Long orderId,
+                                 @RequestParam Long amount,
+                                 @RequestHeader(value = "X-Payment-Signature", required = false) String signature) {
+        if (!callbackVerifier.verifyRefund(signature, tradeNo, orderId, amount)) {
+            return Result.fail("退款回调签名无效");
+        }
+        return paymentService.handleRefund(tradeNo, orderId, amount);
     }
 }

@@ -1,131 +1,285 @@
 package com.hmdp.listener;
 
-import cn.hutool.json.JSONUtil;
+import cn.hutool.core.bean.BeanUtil;
 import com.hmdp.config.QueueConfig;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.enums.OrderCreationResult;
+import com.hmdp.enums.OrderStatus;
 import com.hmdp.service.IVoucherOrderService;
-import com.rabbitmq.client.Channel;
-import lombok.RequiredArgsConstructor;
+import com.hmdp.utils.ConfirmedRabbitPublisher;
+import com.hmdp.utils.RedisConstants;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessagePostProcessor;
-import org.springframework.amqp.rabbit.annotation.RabbitListener;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.data.redis.connection.stream.Consumer;
+import org.springframework.data.redis.connection.stream.ByteRecord;
+import org.springframework.data.redis.connection.stream.PendingMessages;
+import org.springframework.data.redis.connection.stream.MapRecord;
+import org.springframework.data.redis.connection.stream.ReadOffset;
+import org.springframework.data.redis.connection.stream.StreamOffset;
+import org.springframework.data.redis.connection.stream.StreamReadOptions;
+import org.springframework.data.domain.Range;
+import org.springframework.data.redis.core.RedisCallback;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
-import java.io.IOException;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.nio.charset.StandardCharsets;
+import java.util.stream.Collectors;
 
-/**
- * 秒杀券订单监听器 —— 消费MQ消息，异步创建订单
- *
- * 【设计原则】
- * - 消费端必须走 IVoucherOrderService#handleVoucherOrder → #createVoucherOrder 链路，
- *   不允许直接 baseMapper.save() 裸写：
- *   1. 保证 Redisson 分布式锁兜底（防止 MQ 重复投递 / QA+QD 双消费者同时命中同一用户导致重复下单）
- *   2. 保证 createVoucherOrder 上的 @Transactional 生效
- *   3. 保证"一人一单 DB 二次校验 + 乐观锁扣 seckill_stock + save 订单 + 清理 pending 缓存"的原子一致性
- * - 使用手动 ACK（Channel#basicAck/#basicNack）：显式确认处理成功/失败，防止异常被吃掉后
- *   RabbitMQ 仍认为消费成功、消息丢失但订单实际未入 DB。
- */
-@Component
-@RequiredArgsConstructor
 @Slf4j
+@Component
 public class SeckillVoucherListener {
+
+    private static final int PENDING_BATCH_SIZE = 20;
+    private static final int MAX_PENDING_SCAN = 200;
+
+    private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "seckill-order-consumer");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final String consumerName = "order-" + java.lang.management.ManagementFactory
+            .getRuntimeMXBean().getName().replace('@', '-');
+    private volatile boolean running = true;
+    private String ownPendingCursor = "0";
+    private String abandonedPendingCursor;
 
     @Resource
     private IVoucherOrderService voucherOrderService;
-
     @Resource
-    private RabbitTemplate rabbitTemplate;
+    private StringRedisTemplate stringRedisTemplate;
+    @Resource
+    private ConfirmedRabbitPublisher confirmedRabbitPublisher;
 
-    /**
-     * QA 正常消费者
-     */
-    @RabbitListener(queues = "QA")
-    public void receivedA(Message message, Channel channel) throws Exception {
-        long tag = message.getMessageProperties().getDeliveryTag();
+    @PostConstruct
+    public void start() {
+        createConsumerGroup();
+        executor.submit(this::consumeLoop);
+    }
+
+    @PreDestroy
+    public void stop() {
+        running = false;
+        executor.shutdownNow();
+    }
+
+    private void createConsumerGroup() {
         try {
-            String msg = new String(message.getBody());
-            log.info("[QA] 收到秒杀落库消息: msg={}", msg);
-            VoucherOrder voucherOrder = JSONUtil.toBean(msg, VoucherOrder.class);
-            if (voucherOrder == null || voucherOrder.getId() == null
-                    || voucherOrder.getUserId() == null || voucherOrder.getVoucherId() == null) {
-                log.warn("[QA] 消息非法，直接丢弃：msg={}", msg);
-                channel.basicAck(tag, false);
-                return;
-            }
-            voucherOrderService.handleVoucherOrder(voucherOrder);
-
-            // 保存/落库成功后发送延迟取消消息（计时起点 = 落库成功时刻）
-            sendOrderDelayMessage(voucherOrder.getId());
-            channel.basicAck(tag, false);
+            stringRedisTemplate.execute((RedisCallback<Object>) connection -> connection.execute(
+                    "XGROUP",
+                    "CREATE".getBytes(),
+                    RedisConstants.SECKILL_ORDER_STREAM_KEY.getBytes(),
+                    RedisConstants.SECKILL_ORDER_STREAM_GROUP.getBytes(),
+                    "0".getBytes(),
+                    "MKSTREAM".getBytes()
+            ));
         } catch (Exception e) {
-            log.error("[QA] 消费秒杀落库失败，tag={}, body={}", tag,
-                    message.getBody() == null ? null : new String(message.getBody()), e);
-            try {
-                // 异常 requeue=false，进入死信队列 QD 做兜底；避免无限重试阻塞 QA 队列
-                channel.basicNack(tag, false, false);
-            } catch (IOException ioe) {
-                log.error("[QA] basicNack 失败", ioe);
+            if (e.getMessage() == null || !e.getMessage().contains("BUSYGROUP")) {
+                throw e;
             }
         }
     }
 
-    /**
-     * QD 死信消费者（兜底）
-     */
-    @RabbitListener(queues = "QD")
-    public void receivedD(Message message, Channel channel) throws Exception {
-        long tag = message.getMessageProperties().getDeliveryTag();
-        try {
-            String msg = new String(message.getBody());
-            log.info("[QD] 死信队列收到秒杀落库消息: msg={}", msg);
-            VoucherOrder voucherOrder = JSONUtil.toBean(msg, VoucherOrder.class);
-            if (voucherOrder == null || voucherOrder.getId() == null
-                    || voucherOrder.getUserId() == null || voucherOrder.getVoucherId() == null) {
-                log.warn("[QD] 消息非法，丢弃：msg={}", msg);
-                channel.basicAck(tag, false);
-                return;
-            }
-            voucherOrderService.handleVoucherOrder(voucherOrder);
-
-            sendOrderDelayMessage(voucherOrder.getId());
-            channel.basicAck(tag, false);
-        } catch (Exception e) {
-            log.error("[QD] 死信消费秒杀落库失败，tag={}, body={}", tag,
-                    message.getBody() == null ? null : new String(message.getBody()), e);
+    private void consumeLoop() {
+        while (running && !Thread.currentThread().isInterrupted()) {
             try {
-                // 死信消费失败不再 requeue，避免循环；依赖 pending 缓存 TTL + 支付时主动落库兜底
-                channel.basicNack(tag, false, false);
-            } catch (IOException ioe) {
-                log.error("[QD] basicNack 失败", ioe);
+                List<MapRecord<String, Object, Object>> records = stringRedisTemplate.opsForStream().read(
+                        Consumer.from(RedisConstants.SECKILL_ORDER_STREAM_GROUP, consumerName),
+                        StreamReadOptions.empty().count(10).block(Duration.ofSeconds(2)),
+                        StreamOffset.create(RedisConstants.SECKILL_ORDER_STREAM_KEY, ReadOffset.lastConsumed())
+                );
+                processRecords(records);
+                processOwnPending();
+                claimAbandonedPending();
+            } catch (Exception e) {
+                if (running) {
+                    log.error("消费秒杀订单Stream失败, consumer={}", consumerName, e);
+                    try {
+                        Thread.sleep(200);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
             }
         }
     }
 
-    /**
-     * 发送订单延迟取消消息（TTL = QueueConfig.ORDER_DELAY_TTL，30 分钟）
-     */
-    private void sendOrderDelayMessage(Long orderId) {
-        if (orderId == null) {
-            log.warn("orderId为空，跳过发送延迟取消消息");
+    private void processOwnPending() {
+        int scanned = 0;
+        while (scanned < MAX_PENDING_SCAN) {
+            List<MapRecord<String, Object, Object>> pending = stringRedisTemplate.opsForStream().read(
+                    Consumer.from(RedisConstants.SECKILL_ORDER_STREAM_GROUP, consumerName),
+                    StreamReadOptions.empty().count(PENDING_BATCH_SIZE),
+                    StreamOffset.create(
+                            RedisConstants.SECKILL_ORDER_STREAM_KEY,
+                            ReadOffset.from(ownPendingCursor))
+            );
+            if (pending == null || pending.isEmpty()) {
+                ownPendingCursor = "0";
+                return;
+            }
+            processRecords(pending);
+            scanned += pending.size();
+            ownPendingCursor = pending.get(pending.size() - 1).getId().getValue();
+            if (pending.size() < PENDING_BATCH_SIZE) {
+                ownPendingCursor = "0";
+                return;
+            }
+        }
+    }
+
+    private void claimAbandonedPending() {
+        int scanned = 0;
+        while (scanned < MAX_PENDING_SCAN) {
+            final Range<String> range = abandonedPendingCursor == null
+                    ? Range.unbounded()
+                    : Range.rightUnbounded(Range.Bound.exclusive(abandonedPendingCursor));
+            PendingBatch batch = stringRedisTemplate.execute(
+                    (RedisCallback<PendingBatch>) connection -> {
+                    PendingMessages pending = connection.xPending(
+                            RedisConstants.SECKILL_ORDER_STREAM_KEY.getBytes(StandardCharsets.UTF_8),
+                            RedisConstants.SECKILL_ORDER_STREAM_GROUP, range,
+                            (long) PENDING_BATCH_SIZE);
+                    if (pending.isEmpty()) {
+                        return PendingBatch.empty();
+                    }
+                    List<String> ids = pending.stream()
+                            .filter(message -> message.getElapsedTimeSinceLastDelivery().compareTo(
+                                    Duration.ofSeconds(30)) >= 0)
+                            .map(message -> message.getIdAsString())
+                            .collect(Collectors.toList());
+                    if (ids.isEmpty()) {
+                        return new PendingBatch(java.util.Collections.emptyList(),
+                                pending.get(pending.size() - 1).getIdAsString(), pending.size());
+                    }
+                    List<ByteRecord> records = connection.xClaim(
+                            RedisConstants.SECKILL_ORDER_STREAM_KEY.getBytes(StandardCharsets.UTF_8),
+                            RedisConstants.SECKILL_ORDER_STREAM_GROUP,
+                            consumerName,
+                            org.springframework.data.redis.connection.RedisStreamCommands.XClaimOptions
+                                    .minIdle(Duration.ofSeconds(30))
+                                    .ids(ids.toArray(new String[0])));
+                    List<MapRecord<String, Object, Object>> claimed = new java.util.ArrayList<>();
+                    for (ByteRecord record : records) {
+                        MapRecord<String, String, String> deserialized = record.deserialize(
+                                stringRedisTemplate.getStringSerializer(),
+                                stringRedisTemplate.getStringSerializer(),
+                                stringRedisTemplate.getStringSerializer());
+                        @SuppressWarnings({"unchecked", "rawtypes"})
+                        MapRecord<String, Object, Object> converted = (MapRecord) deserialized;
+                        claimed.add(converted);
+                    }
+                    return new PendingBatch(claimed,
+                            pending.get(pending.size() - 1).getIdAsString(), pending.size());
+                });
+            if (batch == null || batch.scanned == 0) {
+                abandonedPendingCursor = null;
+                return;
+            }
+            processRecords(batch.records);
+            scanned += batch.scanned;
+            abandonedPendingCursor = batch.lastId;
+            if (batch.scanned < PENDING_BATCH_SIZE) {
+                abandonedPendingCursor = null;
+                return;
+            }
+        }
+    }
+
+    private void processRecords(List<MapRecord<String, Object, Object>> records) {
+        if (records == null || records.isEmpty()) {
             return;
         }
+        for (MapRecord<String, Object, Object> record : records) {
+            try {
+                VoucherOrder order = toOrder(record.getValue());
+                OrderCreationResult result = voucherOrderService.handleVoucherOrder(order);
+                if (result == OrderCreationResult.ACTIVE_ORDER_EXISTS) {
+                    voucherOrderService.releaseRejectedReservation(order, true, false);
+                } else if (result == OrderCreationResult.OUT_OF_STOCK) {
+                    // Redis was ahead of MySQL. Keep the pre-decrement so cached stock converges to DB.
+                    voucherOrderService.releaseRejectedReservation(order, false, true);
+                } else {
+                    sendOrderDelayMessage(order);
+                }
+                acknowledgeAndDelete(record);
+            } catch (IllegalArgumentException e) {
+                log.error("丢弃非法秒杀订单消息: id={}", record.getId(), e);
+                acknowledgeAndDelete(record);
+            } catch (RuntimeException e) {
+                log.error("秒杀订单消息处理失败，保留pending等待重试: id={}", record.getId(), e);
+            }
+        }
+    }
+
+    private void acknowledgeAndDelete(MapRecord<String, Object, Object> record) {
+        stringRedisTemplate.opsForStream().acknowledge(
+                RedisConstants.SECKILL_ORDER_STREAM_KEY,
+                RedisConstants.SECKILL_ORDER_STREAM_GROUP,
+                record.getId());
         try {
-            MessagePostProcessor messagePostProcessor = message -> {
-                message.getMessageProperties().setExpiration(String.valueOf(QueueConfig.ORDER_DELAY_TTL));
-                return message;
-            };
-            rabbitTemplate.convertAndSend(
-                    QueueConfig.ORDER_DELAY_EXCHANGE,
-                    QueueConfig.ORDER_DELAY_ROUTING_KEY,
-                    orderId.toString(),
-                    messagePostProcessor
-            );
-            log.info("已发送订单延迟取消消息: orderId={}, TTL={}ms", orderId, QueueConfig.ORDER_DELAY_TTL);
-        } catch (Exception e) {
-            log.error("发送订单延迟取消消息失败: orderId={}", orderId, e);
+            stringRedisTemplate.opsForStream().delete(
+                    RedisConstants.SECKILL_ORDER_STREAM_KEY, record.getId());
+        } catch (RuntimeException e) {
+            log.warn("删除已完成秒杀Stream记录失败: id={}", record.getId(), e);
+        }
+    }
+
+    private VoucherOrder toOrder(Map<Object, Object> values) {
+        VoucherOrder order = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
+        if (order.getCreateTime() == null) {
+            Object epoch = values.get("createEpoch");
+            long epochSecond = epoch == null ? Instant.now().getEpochSecond()
+                    : Long.parseLong(epoch.toString());
+            order.setCreateTime(LocalDateTime.ofInstant(
+                    Instant.ofEpochSecond(epochSecond), ZoneId.systemDefault()));
+        }
+        order.setStatus(OrderStatus.UNPAID.getCode());
+        if (order.getId() == null || order.getUserId() == null || order.getVoucherId() == null) {
+            throw new IllegalArgumentException("秒杀订单消息字段不完整");
+        }
+        return order;
+    }
+
+    private void sendOrderDelayMessage(VoucherOrder order) {
+        long elapsedMillis = order.getCreateTime() == null ? 0L
+                : Math.max(0L, Duration.between(
+                        order.getCreateTime(), LocalDateTime.now()).toMillis());
+        long remainingMillis = Math.max(1L, QueueConfig.ORDER_DELAY_TTL - elapsedMillis);
+        MessagePostProcessor expiration = message -> {
+            message.getMessageProperties().setExpiration(String.valueOf(remainingMillis));
+            return message;
+        };
+        confirmedRabbitPublisher.send(
+                QueueConfig.ORDER_DELAY_EXCHANGE,
+                QueueConfig.ORDER_DELAY_ROUTING_KEY,
+                order.getId().toString(), expiration, "order-delay:" + order.getId());
+    }
+
+    private static final class PendingBatch {
+        private final List<MapRecord<String, Object, Object>> records;
+        private final String lastId;
+        private final int scanned;
+
+        private PendingBatch(List<MapRecord<String, Object, Object>> records,
+                             String lastId, int scanned) {
+            this.records = records;
+            this.lastId = lastId;
+            this.scanned = scanned;
+        }
+
+        private static PendingBatch empty() {
+            return new PendingBatch(java.util.Collections.emptyList(), null, 0);
         }
     }
 }

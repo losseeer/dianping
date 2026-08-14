@@ -86,7 +86,7 @@ maxPrice/minScore 说明：两个搜索工具都接受；均为 client-side 后�
 }}""")
 
 
-GENERATE_SYSTEM_PROMPT = harden_system_prompt("""你是探店推荐 Top-5 生成器。必须从给定候选里选，输出严格合法 JSON。
+GENERATE_SYSTEM_PROMPT = harden_system_prompt("""你是店铺/景点推荐生成器。必须从给定候选里选出5个店铺/景点，输出严格合法 JSON。
 
 输入：
  用户请求：{user_message}

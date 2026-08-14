@@ -26,12 +26,22 @@ local voucherId=ARGV[1]
 local userId=ARGV[2]
 --1.3.订单id
 local orderId=ARGV[3]
+--1.4.预订单JSON
+local orderJson=ARGV[4]
+--1.5.预订单创建时间（epoch秒）
+local createEpoch=ARGV[5]
+--1.6.预订单TTL（秒）
+local pendingTtl=tonumber(ARGV[6])
+--1.7.下单金额快照（分）
+local amount=ARGV[7]
 
 -- 2.数据key
 --2.1.库存key
 local stockKey='seckill:stock:' .. voucherId
 --2.2.订单key
 local orderKey='seckill:order:' .. voucherId
+local pendingOrderKey='seckill:order:pending:' .. orderId
+local pendingUserKey='seckill:order:pending:user:' .. userId
 
 -- 3.脚本业务
 --3.1.判断库存是否充足
@@ -62,9 +72,17 @@ end
 redis.call('incrby',stockKey,-1)
 -- 3.6.下单(保存)用户 sadd orderKey userId
 redis.call('sadd',orderKey,userId)
--- 3.7. 发消息到消息队列中 XADD  stream.orders * k1 v1 k2 v2
+-- 3.7. 保存预订单和用户索引。它们与预扣库存、下单事件一起原子提交，
+-- 避免应用在Lua返回后崩溃造成“扣了库存但既没有订单事件也查不到预订单”。
+redis.call('set',pendingOrderKey,orderJson,'EX',pendingTtl)
+redis.call('zadd',pendingUserKey,createEpoch,orderId)
+redis.call('expire',pendingUserKey,pendingTtl)
+-- 3.8. 发消息到Redis Stream
 -- 【八股：为什么Lua脚本里直接发消息到Stream？】
 -- 把"扣库存+记录订单+发消息"都放在Lua里原子执行
 -- 确保只要库存扣了，消息就一定发出去了（要么都成功，要么都失败）
 -- 后续消费者从Stream里消费消息，异步创建数据库订单
-redis.call('xadd','stream.orders','*', 'userId',userId,'voucherId',voucherId,'id',orderId)
+redis.call('xadd','stream.orders','*',
+        'userId',userId,'voucherId',voucherId,'id',orderId,
+        'createEpoch',createEpoch,'amount',amount)
+return 0

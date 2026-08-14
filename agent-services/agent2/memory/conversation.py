@@ -26,6 +26,7 @@ from core.mysql_store import (
 from graph.utils import normalize_score
 
 logger = logging.getLogger(__name__)
+_compressing_threads: set[str] = set()
 
 SUMMARIZE_PROMPT = """你是对话上下文压缩器。请将以下多轮对话压缩为简洁的 bullet points 摘要。
 
@@ -127,10 +128,15 @@ async def append_turn(thread_id: str, user_id: int, role: str, content: str) -> 
             await _compress(thread_id, all_turns)
         except Exception as e:
             logger.warning(f"Background compress silently failed for thread {thread_id}: {e}")
+        finally:
+            _compressing_threads.discard(thread_id)
 
     try:
         loop = asyncio.get_running_loop()
-        task = loop.create_task(_bg_compress())
+        task = None
+        if thread_id not in _compressing_threads:
+            _compressing_threads.add(thread_id)
+            task = loop.create_task(_bg_compress())
 
         def _log_done(t: asyncio.Task):
             try:
@@ -140,7 +146,10 @@ async def append_turn(thread_id: str, user_id: int, role: str, content: str) -> 
                     logger.error(f"Compress task exception for {thread_id}: {exc}")
             except Exception:  # noqa: BLE001
                 pass
-        task.add_done_callback(_log_done)
+            finally:
+                _compressing_threads.discard(thread_id)
+        if task:
+            task.add_done_callback(_log_done)
     except RuntimeError:
         # 没有运行中的事件循环（比如单元测试直接调用），退化为同步 _compress，但不 await 其返回值
         logger.debug("No running loop, append_turn skipping background compress (will piggyback later)")
@@ -179,7 +188,7 @@ async def get_context_summary(thread_id: str) -> str:
         return "(新会话，无历史上下文)"
 
     # dirty 且缓存 miss → piggyback kick 一次后台压缩（方案 B 兜底），不等待
-    if dirty and not cached_str:
+    if dirty and not cached_str and thread_id not in _compressing_threads:
         async def _bg_compress_piggyback():
             try:
                 reset_token_usage()
@@ -189,9 +198,13 @@ async def get_context_summary(thread_id: str) -> str:
                 await _compress(thread_id, turns)
             except Exception as e:
                 logger.warning(f"Piggyback compress silently failed: {e}")
+            finally:
+                _compressing_threads.discard(thread_id)
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(_bg_compress_piggyback())
+            _compressing_threads.add(thread_id)
+            task = loop.create_task(_bg_compress_piggyback())
+            task.add_done_callback(lambda _: _compressing_threads.discard(thread_id))
         except RuntimeError:
             logger.debug("No running loop, piggyback compress skipped (next request will retry)")
 

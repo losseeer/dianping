@@ -1,6 +1,9 @@
 """Graph 工具：计时、state 辅助、JSON 解析"""
 import json
 import time
+from functools import wraps
+
+from core.observability import workflow_event
 
 def _sv(state, key, default=None):
     """统一获取 state 值 — 兼容 dict 和 AgentState"""
@@ -12,16 +15,34 @@ def _sv(state, key, default=None):
 def timed_node(name: str):
     """节点计时装饰器 — 记录每个节点的耗时和输入/输出摘要"""
     def decorator(func):
+        @wraps(func)
         async def wrapper(state) -> dict:
             start = time.time()
             input_summary = _summarize_state(state, name)
-            result = await func(state)
+            workflow_event(
+                "node.started",
+                node=name,
+                inputSummary=input_summary,
+                iterationCount=_sv(state, "iteration_count", 0),
+            )
+            try:
+                result = await func(state)
+            except Exception as exc:
+                workflow_event(
+                    "node.failed",
+                    node=name,
+                    durationMs=round((time.time() - start) * 1000, 1),
+                    errorType=type(exc).__name__,
+                    error=str(exc),
+                )
+                raise
             elapsed = (time.time() - start) * 1000
+            output_summary = _summarize_result(result)
 
             node_log = {
                 "nodeName": name,
                 "inputSummary": input_summary[:200],
-                "outputSummary": _summarize_result(result)[:200],
+                "outputSummary": output_summary[:200],
                 "llmCalls": 1 if any(k in name for k in ("plan", "evaluate", "generate", "memory")) else 0,
                 "durationMs": round(elapsed, 1),
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -32,6 +53,13 @@ def timed_node(name: str):
             existing_logs.append(node_log)
 
             result["node_logs"] = existing_logs
+            workflow_event(
+                "node.completed",
+                node=name,
+                durationMs=round(elapsed, 1),
+                outputSummary=output_summary,
+                nodeLog=node_log,
+            )
             return result
         return wrapper
     return decorator
@@ -131,5 +159,4 @@ def rank_shops(shops: list[dict], score_weight: float = 0.5, distance_weight: fl
         return score_weight * score_norm + distance_weight * distance_norm
 
     return sorted(shops, key=_rank_key, reverse=True)
-
 

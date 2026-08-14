@@ -3,6 +3,7 @@ package com.hmdp.listener;
 import cn.hutool.json.JSONUtil;
 import com.hmdp.config.QueueConfig;
 import com.hmdp.service.IPaymentService;
+import com.hmdp.dto.Result;
 import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.Message;
@@ -109,6 +110,8 @@ public class PayNotifyListener {
             Map<String, Object> map = JSONUtil.toBean(msg, Map.class);
             Long orderId = Long.valueOf(map.get("orderId").toString());
             String tradeNo = map.get("tradeNo") != null ? map.get("tradeNo").toString() : "";
+            Long amount = map.get("amount") == null ? null
+                    : Long.valueOf(map.get("amount").toString());
 
             // 模拟调用第三方退款API
             log.info("【模拟退款API】调用第三方退款API，tradeNo={}, orderId={}", tradeNo, orderId);
@@ -121,7 +124,11 @@ public class PayNotifyListener {
             }
 
             // 退款成功，调用handleRefund完成退款（更新订单状态、恢复库存）
-            paymentService.handleRefund(tradeNo, orderId);
+            Result result = paymentService.handleRefund(tradeNo, orderId, amount);
+            if (result == null || Boolean.FALSE.equals(result.getSuccess())) {
+                throw new IllegalStateException(result == null
+                        ? "退款回调无结果" : result.getErrorMsg());
+            }
 
             log.info("退款处理完成: orderId={}, tradeNo={}", orderId, tradeNo);
 

@@ -3,6 +3,7 @@ package com.hmdp.service;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.VoucherOrder;
 import com.baomidou.mybatisplus.extension.service.IService;
+import com.hmdp.enums.OrderCreationResult;
 
 /**
  * <p>
@@ -16,9 +17,13 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
 
     Result seckillVoucher(Long voucherId);
 
-    void createVoucherOrder(VoucherOrder voucherOrder);
+    OrderCreationResult createVoucherOrder(VoucherOrder voucherOrder);
 
-    void handleVoucherOrder(VoucherOrder voucherOrder);
+    OrderCreationResult handleVoucherOrder(VoucherOrder voucherOrder);
+
+    void releaseRejectedReservation(VoucherOrder voucherOrder,
+                                    boolean restoreRedisStock,
+                                    boolean releaseQualification);
 
     /**
      * 查询订单（先查 DB，查不到再查 Redis pending 预订单），

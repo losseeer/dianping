@@ -27,6 +27,7 @@ from improve.signals import (
     piggyback_mark_started,
 )
 from improve.distill import playbook_distill, preference_distill
+from core.observability import workflow_event
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,12 @@ async def process_pending_batch(max_items: int = 8, min_cool_seconds: int = 60) 
     t0 = time.perf_counter()
 
     ids = pop_pending_batch(max_items=max_items, min_cool_seconds=min_cool_seconds)
+    workflow_event(
+        "distill.batch_started",
+        mode="daemon_or_cli",
+        requestedCount=max_items,
+        selectedCount=len(ids),
+    )
     if not ids:
         stats.elapsed_ms = (time.perf_counter() - t0) * 1000
         return stats
@@ -65,12 +72,22 @@ async def process_pending_batch(max_items: int = 8, min_cool_seconds: int = 60) 
             if record is None:
                 # 轨迹过期或被删 → 标记 processed 避免下次再扫
                 mark_processed(tid, "missing_record")
+                workflow_event("distill.trajectory_skipped", trajectoryId=tid, reason="missing_record")
                 continue
 
             accepted = detect_acceptance(record)
+            workflow_event(
+                "distill.signal_evaluated",
+                trajectoryId=tid,
+                accepted=accepted,
+                outcome=record.outcome,
+                candidateCount=record.candidateCount,
+                reflectionScore=record.reflectionScore,
+            )
             if not accepted:
                 mark_processed(tid, "no_signal")
                 stats.skipped_no_signal += 1
+                workflow_event("distill.trajectory_skipped", trajectoryId=tid, reason="no_signal")
                 continue
 
             # Playbook 映射蒸馏
@@ -82,16 +99,24 @@ async def process_pending_batch(max_items: int = 8, min_cool_seconds: int = 60) 
                 stats.playbook_added += added
 
             # 用户偏好蒸馏
+            preference_updated = False
             if record.userId > 0:
                 pref_patch = preference_distill(record)
                 if pref_patch:
                     await save_user_preferences(record.userId, pref_patch)
                     stats.pref_updated_users += 1
+                    preference_updated = True
 
             mark_processed(tid, "ok")
+            workflow_event(
+                "distill.trajectory_completed",
+                trajectoryId=tid,
+                preferenceUpdated=preference_updated,
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"distill worker failed for trajectory {tid}: {e}")
             stats.errored += 1
+            workflow_event("distill.trajectory_failed", level=logging.ERROR, trajectoryId=tid, errorType=type(e).__name__, error=str(e))
             try:
                 mark_processed(tid, f"error:{type(e).__name__}")
             except Exception:  # noqa: BLE001
@@ -105,6 +130,16 @@ async def process_pending_batch(max_items: int = 8, min_cool_seconds: int = 60) 
             stats.scanned, stats.playbook_added, stats.pref_updated_users,
             stats.skipped_no_signal, stats.errored, stats.elapsed_ms,
         )
+    workflow_event(
+        "distill.batch_completed",
+        mode="daemon_or_cli",
+        scanned=stats.scanned,
+        playbookAdded=stats.playbook_added,
+        preferenceUsers=stats.pref_updated_users,
+        skippedNoSignal=stats.skipped_no_signal,
+        errors=stats.errored,
+        elapsedMs=round(stats.elapsed_ms, 1),
+    )
     return stats
 
 
@@ -119,12 +154,14 @@ async def piggyback_scan() -> WorkerStats:
         pass
 
     if not piggyback_should_run():
+        workflow_event("distill.piggyback_skipped", reason="throttled")
         return WorkerStats()
     piggyback_mark_started()
 
     t0 = time.perf_counter()
     stats = WorkerStats()
     ids = pop_pending_batch(max_items=PIGGYBACK_MAX, min_cool_seconds=60)
+    workflow_event("distill.batch_started", mode="piggyback", requestedCount=PIGGYBACK_MAX, selectedCount=len(ids))
     if not ids:
         return stats
 
@@ -138,25 +175,38 @@ async def piggyback_scan() -> WorkerStats:
             record = trajectory_store.get(tid)
             if record is None:
                 mark_processed(tid, "missing_record")
+                workflow_event("distill.trajectory_skipped", trajectoryId=tid, reason="missing_record")
                 continue
-            if not detect_acceptance(record):
+            accepted = detect_acceptance(record)
+            workflow_event("distill.signal_evaluated", trajectoryId=tid, accepted=accepted, outcome=record.outcome, candidateCount=record.candidateCount, reflectionScore=record.reflectionScore)
+            if not accepted:
                 mark_processed(tid, "no_signal")
                 stats.skipped_no_signal += 1
+                workflow_event("distill.trajectory_skipped", trajectoryId=tid, reason="no_signal")
                 continue
 
             mappings = playbook_distill(record)
             if mappings:
                 added = await playbook.add_mapping_entries(mappings, origin_trajectory_id=record.trajectoryId)
                 stats.playbook_added += added
+            preference_updated = False
             if record.userId > 0:
                 patch = preference_distill(record)
                 if patch:
                     await save_user_preferences(record.userId, patch)
                     stats.pref_updated_users += 1
+                    preference_updated = True
             mark_processed(tid, "ok")
+            workflow_event(
+                "distill.trajectory_completed",
+                trajectoryId=tid,
+                mode="piggyback",
+                preferenceUpdated=preference_updated,
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Piggyback distill failed for {tid}: {e}")
             stats.errored += 1
+            workflow_event("distill.trajectory_failed", level=logging.ERROR, trajectoryId=tid, mode="piggyback", errorType=type(e).__name__, error=str(e))
             try:
                 mark_processed(tid, f"error:{type(e).__name__}")
             except Exception:  # noqa: BLE001
@@ -169,6 +219,16 @@ async def piggyback_scan() -> WorkerStats:
             stats.scanned, stats.playbook_added, stats.pref_updated_users,
             stats.skipped_no_signal, stats.errored, stats.elapsed_ms,
         )
+    workflow_event(
+        "distill.batch_completed",
+        mode="piggyback",
+        scanned=stats.scanned,
+        playbookAdded=stats.playbook_added,
+        preferenceUsers=stats.pref_updated_users,
+        skippedNoSignal=stats.skipped_no_signal,
+        errors=stats.errored,
+        elapsedMs=round(stats.elapsed_ms, 1),
+    )
     return stats
 
 
@@ -206,10 +266,8 @@ def main() -> int:
     args = parser.parse_args()
 
     # 配置 logging（CLI 独立运行时）
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    from core.observability import configure_logging
+    configure_logging()
 
     if args.loop:
         return asyncio.run(_run_loop(args.interval, args.max_items))

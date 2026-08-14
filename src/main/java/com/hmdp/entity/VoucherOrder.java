@@ -52,6 +52,12 @@ public class VoucherOrder implements Serializable {
      */
     private Integer status;
 
+    /** 1 means this order still occupies the one-user-one-voucher qualification. */
+    private Integer activeFlag;
+
+    /** Amount captured when the order is placed, in cents. */
+    private Long amount;
+
     /**
      * 下单时间
      */

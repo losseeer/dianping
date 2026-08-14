@@ -15,6 +15,13 @@ from core.llm import LLMBusyError
 from graph.hitl import save_hitl_state, load_hitl_state, delete_hitl_state
 from core.guard import guard_user_message
 from core.llm import reset_token_usage, get_token_usage
+from core.observability import (
+    configure_logging,
+    new_request_id,
+    update_workflow_context,
+    workflow_event,
+    workflow_context,
+)
 from core.shop_api_http import shop_api
 from memory.preferences import load_memory
 from memory.playbook import playbook
@@ -27,6 +34,8 @@ from graph.nodes import update_memory_node
 
 logger = logging.getLogger(__name__)
 
+configure_logging()
+
 app = FastAPI(title="Agent2 - Shop Recommendation (Harness Enhanced)", version="2.0.0")
 
 app.add_middleware(
@@ -37,9 +46,42 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def workflow_http_logging(request, call_next):
+    """Correlate every HTTP request with its structured workflow events."""
+    request_id = new_request_id()
+    operation = f"{request.method} {request.url.path}"
+    with workflow_context(requestId=request_id, operation=operation):
+        workflow_event("request.received", method=request.method, path=request.url.path)
+        try:
+            response = await call_next(request)
+            workflow_event(
+                "request.completed",
+                statusCode=response.status_code,
+                path=request.url.path,
+            )
+        except Exception as exc:
+            workflow_event(
+                "request.failed",
+                level=logging.ERROR,
+                path=request.url.path,
+                errorType=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        response.headers["X-Agent2-Request-Id"] = request_id
+        return response
+
+
 def _save_interrupt_state(thread_id: str, state: AgentState) -> None:
     """序列化 AgentState 并写入 HITL 中断状态，供 resume 接口恢复"""
     save_hitl_state(thread_id, state.model_dump_json())
+    workflow_event(
+        "hitl.state_saved",
+        threadId=thread_id,
+        trajectoryId=state.trajectory_id,
+        nodeCount=len(state.node_logs),
+    )
 
 
 # --- 核心 API（生产必需，不可删） ---
@@ -47,6 +89,14 @@ def _save_interrupt_state(thread_id: str, state: AgentState) -> None:
 @app.post("/agent2/chat")
 async def chat_endpoint(req: ChatRequest):
     """商户推荐对话入口"""
+    thread_id = req.threadId or str(uuid.uuid4())
+    update_workflow_context(userId=req.userId, threadId=thread_id, operation="chat")
+    workflow_event(
+        "chat.received",
+        userMessage=req.message,
+        hasCoordinates=req.x is not None and req.y is not None,
+        resumed=bool(req.threadId),
+    )
     try:
         from memory.conversation import append_turn, save_last_shops, get_recommended_ids, add_recommended_ids
 
@@ -54,10 +104,10 @@ async def chat_endpoint(req: ChatRequest):
         if not req.userId or req.userId <= 0:
             return {"type": "error", "error": "请先登录后再使用AI美食助手"}
 
-        thread_id = req.threadId or str(uuid.uuid4())
-
         clean_msg = guard_user_message(req.message)
+        workflow_event("input.sanitized", originalLength=len(req.message), cleanLength=len(clean_msg))
         await append_turn(thread_id, req.userId, "user", clean_msg)
+        workflow_event("conversation.user_turn_saved", role="user")
 
         initial_state = AgentState(
             user_message=clean_msg,
@@ -69,12 +119,28 @@ async def chat_endpoint(req: ChatRequest):
         )
 
         reset_token_usage()
+        workflow_event("graph.started", entryNode="load_memory")
         result_state = await compiled_graph.ainvoke(initial_state.model_dump())
         state = AgentState(**result_state)
         token_usage = get_token_usage()
+        update_workflow_context(trajectoryId=state.trajectory_id)
+        workflow_event(
+            "graph.completed",
+            nodeCount=len(state.node_logs),
+            candidateCount=len(state.candidate_shops),
+            iterationCount=state.iteration_count,
+            hitlNeeded=state.hitl_needed,
+            tokenUsage=token_usage,
+        )
 
         if state.hitl_needed:
             _save_interrupt_state(thread_id, state)
+            workflow_event(
+                "hitl.interrupted",
+                question=state.hitl_question,
+                options=state.hitl_options,
+                hitlReason=state.hitl_reason,
+            )
             return {
                 "type": "interrupt",
                 "question": state.hitl_question,
@@ -90,6 +156,12 @@ async def chat_endpoint(req: ChatRequest):
             _new_ids = [s.get("id") or s.get("shopId") for s in (state.ranked_shops or []) if s.get("id") or s.get("shopId")]
             if _new_ids:
                 add_recommended_ids(thread_id, _new_ids)
+            workflow_event(
+                "chat.recommendation_completed",
+                shopCount=len(state.ranked_shops),
+                memoryUpdated=state.memory_updated,
+                trajectoryId=state.trajectory_id,
+            )
             return {
                 "type": "recommendation",
                 "shops": state.ranked_shops,
@@ -105,15 +177,23 @@ async def chat_endpoint(req: ChatRequest):
 
     except LLMBusyError as e:
         logger.warning(f"Agent2 chat LLM busy: {e}")
+        workflow_event("chat.busy", level=logging.WARNING, errorType=type(e).__name__, error=str(e))
         return {"type": "busy", "message": "当前访问高峰，请稍后重试", "detail": str(e)}
     except Exception as e:
         logger.error(f"Agent2 chat failed: {e}", exc_info=True)
+        workflow_event("chat.failed", level=logging.ERROR, errorType=type(e).__name__, error=str(e))
         return {"error": str(e), "type": "error"}
 
 
 @app.post("/agent2/chat/resume")
 async def resume_endpoint(req: ResumeRequest):
     """恢复中断的对话"""
+    update_workflow_context(userId=req.userId, threadId=req.threadId, operation="resume")
+    workflow_event(
+        "resume.received",
+        response=req.response,
+        hasCoordinates=req.x is not None and req.y is not None,
+    )
     try:
         from memory.conversation import append_turn, save_last_shops, get_recommended_ids, add_recommended_ids
 
@@ -126,9 +206,13 @@ async def resume_endpoint(req: ResumeRequest):
         if not raw:
             return {"error": "Thread not found or expired", "type": "error"}
         state = AgentState(**raw)
+        update_workflow_context(trajectoryId=state.trajectory_id)
+        workflow_event("hitl.state_loaded", hitlCount=state.hitl_count, iterationCount=state.iteration_count)
 
         clean_feedback = guard_user_message(req.response)
         await append_turn(thread_id, state.user_id, "user", clean_feedback)
+        workflow_event("input.sanitized", originalLength=len(req.response), cleanLength=len(clean_feedback))
+        workflow_event("conversation.user_turn_saved", role="user", isFeedback=True)
 
         state.user_feedback = clean_feedback
         state.hitl_needed = False
@@ -143,12 +227,28 @@ async def resume_endpoint(req: ResumeRequest):
             state_dict[k] = v
 
         reset_token_usage()
+        workflow_event("graph.started", entryNode="update_memory")
         result_state = await compiled_graph.ainvoke(state_dict)
         state = AgentState(**result_state)
         token_usage = get_token_usage()
+        update_workflow_context(trajectoryId=state.trajectory_id)
+        workflow_event(
+            "graph.completed",
+            nodeCount=len(state.node_logs),
+            candidateCount=len(state.candidate_shops),
+            iterationCount=state.iteration_count,
+            hitlNeeded=state.hitl_needed,
+            tokenUsage=token_usage,
+        )
 
         if state.hitl_needed:
             _save_interrupt_state(thread_id, state)
+            workflow_event(
+                "hitl.interrupted",
+                question=state.hitl_question,
+                options=state.hitl_options,
+                hitlReason=state.hitl_reason,
+            )
             return {
                 "type": "interrupt",
                 "question": state.hitl_question,
@@ -158,6 +258,7 @@ async def resume_endpoint(req: ResumeRequest):
             }
         else:
             delete_hitl_state(thread_id)
+            workflow_event("hitl.state_deleted", threadId=thread_id)
             assistant_msg = state.final_recommendation or json.dumps(state.ranked_shops[:3], ensure_ascii=False)
             await append_turn(thread_id, state.user_id, "assistant", assistant_msg)
             save_last_shops(thread_id, state.ranked_shops or [])
@@ -165,6 +266,12 @@ async def resume_endpoint(req: ResumeRequest):
             _new_ids = [s.get("id") or s.get("shopId") for s in (state.ranked_shops or []) if s.get("id") or s.get("shopId")]
             if _new_ids:
                 add_recommended_ids(thread_id, _new_ids)
+            workflow_event(
+                "resume.recommendation_completed",
+                shopCount=len(state.ranked_shops),
+                memoryUpdated=state.memory_updated,
+                trajectoryId=state.trajectory_id,
+            )
             return {
                 "type": "recommendation",
                 "shops": state.ranked_shops,
@@ -180,9 +287,11 @@ async def resume_endpoint(req: ResumeRequest):
 
     except LLMBusyError as e:
         logger.warning(f"Agent2 resume LLM busy: {e}")
+        workflow_event("resume.busy", level=logging.WARNING, errorType=type(e).__name__, error=str(e))
         return {"type": "busy", "message": "当前访问高峰，请稍后重试", "detail": str(e)}
     except Exception as e:
         logger.error(f"Agent2 resume failed: {e}", exc_info=True)
+        workflow_event("resume.failed", level=logging.ERROR, errorType=type(e).__name__, error=str(e))
         return {"error": str(e), "type": "error"}
 
 
@@ -225,6 +334,8 @@ async def update_trajectory_outcome(trajectory_id: str, outcome: str, feedback: 
 
     这样显式反馈才能闭环：用户反馈 → outcome 变更 → 信号重判 → 学到经验 → 下次推理通过 Playbook augment + memory 生效。
     """
+    update_workflow_context(trajectoryId=trajectory_id, operation="trajectory_outcome")
+    workflow_event("trajectory.outcome_received", outcome=outcome, feedback=feedback)
     trajectory_store.update_outcome(trajectory_id, outcome, feedback)
 
     # Stage4 重判入队
@@ -237,8 +348,10 @@ async def update_trajectory_outcome(trajectory_id: str, outcome: str, feedback: 
         # 重新入队（默认会触发 piggyback fire-and-forget，近实时地跑一次蒸馏）
         enqueue_for_distill(trajectory_id, schedule_piggyback=True)
         logger.info(f"[Stage4] outcome={outcome} re-enqueued trajectory={trajectory_id} for distill re-eval")
+        workflow_event("distill.trajectory_reenqueued", outcome=outcome)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[Stage4] re-enqueue distill after outcome update failed silently: {e}")
+        workflow_event("distill.trajectory_reenqueue_failed", level=logging.WARNING, error=str(e))
 
     return {"status": "updated", "trajectoryId": trajectory_id, "outcome": outcome, "reEnqueuedForDistill": True}
 
@@ -318,12 +431,14 @@ async def health():
 @app.on_event("startup")
 async def startup():
     """启动时：拉起自进化蒸馏 daemon（兜底后台任务，每 5 分钟补跑一批轨迹蒸馏）"""
+    workflow_event("service.started", service="agent2", port=config.AGENT2_PORT)
     from improve.signals import start_distill_daemon
     start_distill_daemon(app)
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    workflow_event("service.stopping", service="agent2")
     from improve.signals import cancel_distill_daemon
     cancel_distill_daemon(app)
     await shop_api.close()
@@ -331,6 +446,7 @@ async def shutdown():
     await agent1_client.close()
     from core.mysql_store import close_pool
     await close_pool()
+    workflow_event("service.stopped", service="agent2")
 
 
 if __name__ == "__main__":

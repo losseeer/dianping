@@ -186,8 +186,6 @@ import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { voucherApi } from '@/api/voucher'
 import { voucherOrderApi } from '@/api/voucherOrder'
-import { paymentApi } from '@/api/payment'
-import { orderApi } from '@/api/order'
 import type { Voucher } from '@/types'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import dayjs from 'dayjs'
@@ -374,26 +372,6 @@ function formatDate(d: string) {
   return dayjs(d).format('MM月DD日')
 }
 
-/**
- * 等待订单真正写入 DB（结束异步落库窗口期）。
- * 后端在 Lua 预检通过后返回 orderId，但 tb_voucher_order 实际写入要等 MQ 消费完成。
- * 如果不等就立刻调 /pay，会先触发「订单不存在 → 支付接口主动同步落库」路径（虽已容错但耗时长）；
- * 前端做一层轮询（最多 8 次 × 500ms = 4s）体验更顺畅。
- */
-async function waitOrderReady(orderId: number, maxTimes = 8, intervalMs = 500): Promise<void> {
-  for (let i = 0; i < maxTimes; i++) {
-    try {
-      const res = await orderApi.queryById(orderId)
-      const detail = (res.data as any) || {}
-      // 后端 queryOrderById 返回 { order, voucher, pending }；pending=false 说明 DB 已经落库
-      if (!detail.pending) return
-    } catch (e) {
-      // 第一次可能还没走 /pay 同步落库，queryById 也可能找不到：忽略，继续下一轮
-    }
-    await new Promise(resolve => setTimeout(resolve, intervalMs))
-  }
-}
-
 async function handleSeckill(voucherId: number) {
   if (!userStore.isLoggedIn) {
     router.push({ path: '/login', query: { redirect: '/seckill' } })
@@ -405,20 +383,9 @@ async function handleSeckill(voucherId: number) {
       confirmButtonText: '立即抢购',
       cancelButtonText: '再看看'
     })
-    const res = await voucherOrderApi.seckillVoucher(voucherId)
-    const orderId = res.data as number
-    ElMessage.success('抢购成功！正在完成订单创建...')
-
-    try {
-      // 先轮询等待落库：避免"点立即支付 → 订单不存在"
-      await waitOrderReady(orderId)
-      await paymentApi.pay({ orderId, payType: 1 })
-      ElMessage.success('支付成功！可在我的订单中查看')
-      setTimeout(() => router.push('/orders'), 500)
-    } catch (e) {
-      ElMessage.warning('请前往订单页面完成支付')
-      setTimeout(() => router.push('/orders'), 500)
-    }
+    await voucherOrderApi.seckillVoucher(voucherId)
+    ElMessage.success('抢购成功，请前往订单页完成支付')
+    setTimeout(() => router.push('/orders'), 500)
   } catch (e) {
     // cancelled
   }

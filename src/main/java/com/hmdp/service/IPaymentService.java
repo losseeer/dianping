@@ -42,7 +42,7 @@ public interface IPaymentService {
      * @param orderId 业务订单号
      * @return 处理结果
      */
-    Result handlePayNotify(String tradeNo, Long orderId);
+    Result handlePayNotify(String tradeNo, Long orderId, Long amount);
 
     /**
      * 申请退款
@@ -67,5 +67,5 @@ public interface IPaymentService {
      * @param orderId 业务订单号
      * @return 处理结果
      */
-    Result handleRefund(String tradeNo, Long orderId);
+    Result handleRefund(String tradeNo, Long orderId, Long amount);
 }

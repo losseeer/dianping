@@ -60,6 +60,9 @@ public class PayLog implements Serializable {
      */
     private Integer status;
 
+    /** 1 means this is the pending payment attempt for the order; terminal rows use null. */
+    private Integer pendingFlag;
+
     /**
      * 创建时间
      */

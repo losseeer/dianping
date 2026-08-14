@@ -18,6 +18,7 @@ from graph.utils import _sv, timed_node, _parse_llm_json, normalize_score, rank_
 from graph.prompts import PLAN_SYSTEM_PROMPT, GENERATE_SYSTEM_PROMPT, MEMORY_UPDATE_PROMPT
 from graph.state import AgentState
 from core.models import TrajectoryRecord, TrajectoryNodeLog
+from core.observability import workflow_event
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,8 @@ async def execute_tool(tool_name: str, params: dict, state: AgentState = None) -
 
     state 参数用于获取 recommended_shop_ids 以过滤已推荐商铺（可选，测试时可不传）。
     """
+    workflow_event("tool.started", tool=tool_name, params=params)
+    started = time.perf_counter()
     try:
         if tool_name == "search_shops_by_keyword":
             keyword = params.get("keyword", "")
@@ -36,7 +39,7 @@ async def execute_tool(tool_name: str, params: dict, state: AgentState = None) -
             max_price = params.get("maxPrice")
             min_score = params.get("minScore")
             if max_price:
-                shops = [s for s in shops if s.get("avgPrice", 999) <= max_price]
+                shops = [s for s in shops if float(s.get("avgPrice", 999)) <= max_price]
             if min_score:
                 shops = [s for s in shops if normalize_score(s.get("score")) >= min_score]
             for s in shops:
@@ -45,7 +48,9 @@ async def execute_tool(tool_name: str, params: dict, state: AgentState = None) -
             # 过滤已推荐商铺
             if state:
                 shops = _filter_recommended(shops, state)
-            return {"shops": shops, "count": len(shops)}
+            result = {"shops": shops, "count": len(shops)}
+            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
+            return result
 
         elif tool_name == "search_shops_nearby":
             type_id = params.get("typeId")
@@ -64,34 +69,55 @@ async def execute_tool(tool_name: str, params: dict, state: AgentState = None) -
             # 过滤已推荐商铺
             if state:
                 shops = _filter_recommended(shops, state)
-            return {"shops": shops, "count": len(shops)}
+            result = {"shops": shops, "count": len(shops)}
+            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
+            return result
 
         elif tool_name == "get_shop_detail":
             shop_id = params.get("shopId")
             shop = await shop_api.get_shop_detail(shop_id)
             shop["score"] = normalize_score(shop.get("score"))
-            return {"shop": shop}
+            result = {"shop": shop}
+            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
+            return result
 
         elif tool_name == "get_shop_types":
             types = await shop_api.get_shop_types()
-            return {"types": types}
+            result = {"types": types}
+            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
+            return result
 
         elif tool_name == "get_review_summary":
             shop_id = params.get("shopId")
-            return await agent1_client.get_review_summary(shop_id)
+            result = await agent1_client.get_review_summary(shop_id)
+            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
+            return result
 
         elif tool_name == "get_shop_reviews":
             shop_id = params.get("shopId")
             current = params.get("current", 1)
             reviews = await shop_api.get_shop_reviews(shop_id, current)
-            return {"reviews": reviews, "count": len(reviews) if isinstance(reviews, list) else 0}
+            result = {"reviews": reviews, "count": len(reviews) if isinstance(reviews, list) else 0}
+            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
+            return result
 
         else:
-            return {"error": f"Unknown tool: {tool_name}"}
+            result = {"error": f"Unknown tool: {tool_name}"}
+            workflow_event("tool.rejected", level=logging.WARNING, tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
+            return result
 
     except Exception as e:
         logger.error(f"Tool execution failed: {tool_name}, {e}", exc_info=True)
-        return {"error": str(e)}
+        result = {"error": str(e)}
+        workflow_event(
+            "tool.failed",
+            level=logging.ERROR,
+            tool=tool_name,
+            durationMs=round((time.perf_counter() - started) * 1000, 1),
+            errorType=type(e).__name__,
+            error=str(e),
+        )
+        return result
 
 
 def _filter_recommended(shops: list[dict], state: AgentState) -> list[dict]:
@@ -184,6 +210,13 @@ async def plan_node(state: AgentState) -> dict:
     ])
 
     parsed = _parse_llm_json(response.content)
+    workflow_event(
+        "plan.decided",
+        toolCalls=parsed.get("tool_calls") or [],
+        hitlNeeded=bool(parsed.get("hitl_needed")),
+        reasoning=parsed.get("reasoning", ""),
+        intentAnalysis=parsed.get("intent_analysis") or {},
+    )
 
     # 工具调用白名单校验
     raw_tool_calls = [tc for tc in (parsed.get("tool_calls") or []) if isinstance(tc, dict)]
@@ -235,6 +268,13 @@ async def execute_node(state: AgentState) -> dict:
                 if not any(c.get("id") == s.get("id") for c in new_candidates):
                     new_candidates.append(s)
 
+    workflow_event(
+        "execute.completed",
+        requestedToolCount=len(state.tool_calls),
+        resultCount=len(results),
+        candidateCount=len(new_candidates),
+        results=results,
+    )
     return {
         "tool_results": state.tool_results + results,
         "candidate_shops": new_candidates,
@@ -305,6 +345,14 @@ async def evaluate_node(state: AgentState) -> dict:
     updates = {
         "evaluation": evaluation,
     }
+    workflow_event(
+        "evaluate.decided",
+        evaluation=evaluation,
+        reasoning=reasoning,
+        candidateCount=candidate_count,
+        hitlCount=hitl_count,
+        replanCount=replan_count,
+    )
 
     # 决策日志（保留格式以兼容 eval/runner 指标采集）
     decision = {
@@ -408,6 +456,13 @@ async def replan_relax_node(state: AgentState) -> dict:
             relaxed_params["y"] = state.user_y
 
     logger.info(f"replan_relax applying changes: {changes_applied}")
+    workflow_event(
+        "replan.started",
+        originalTool=last_search_tool,
+        originalParams=last_search_params,
+        relaxedParams=relaxed_params,
+        changes=changes_applied,
+    )
 
     # 3. 重新执行搜索（直接调用 execute_tool，不经过 execute_node，避免影响 tool_calls 状态）
     try:
@@ -467,6 +522,12 @@ async def replan_relax_node(state: AgentState) -> dict:
         "iteration_count": state.iteration_count + 1,
         "decisions": state.decisions + [decision] if state.decisions else [decision],
     }
+    workflow_event(
+        "replan.completed",
+        changes=changes_applied,
+        newShopCount=len(relaxed_shops_list),
+        candidateCount=len(updates["candidate_shops"]),
+    )
     return updates
 
 
@@ -490,6 +551,12 @@ async def update_memory_node(state: AgentState) -> dict:
     await save_memory(state.user_id, memory_update)
 
     updated_memory = await load_memory(state.user_id)
+    workflow_event(
+        "memory.updated",
+        extractedKeywords=extracted_keywords,
+        newPreferences=new_prefs,
+        userId=state.user_id,
+    )
 
     return {
         "memory": updated_memory,
@@ -637,6 +704,14 @@ async def generate_recommendation_node(state: AgentState) -> dict:
 
     shops = parsed.get("shops", [])
     recommendation_text = parsed.get("final_recommendation", "")
+    workflow_event(
+        "recommendation.generated",
+        inputCandidateCount=len(limited_candidates),
+        filteredCandidateCount=len(filtered),
+        relaxedCandidateCount=relaxed_count,
+        shops=shops,
+        finalRecommendation=recommendation_text,
+    )
 
     return {
         "ranked_shops": shops,
@@ -674,6 +749,14 @@ async def log_trajectory_node(state: AgentState) -> dict:
     )
 
     traj_id = trajectory_store.save(record)
+    workflow_event(
+        "trajectory.saved",
+        trajectoryId=traj_id,
+        candidateCount=record.candidateCount,
+        nodeCount=len(record.nodeLogs),
+        decisionCount=len(record.decisions),
+        hitlTriggered=record.hitlTriggered,
+    )
 
     trajectory_store.analyze_trajectory(record)
 
@@ -681,8 +764,10 @@ async def log_trajectory_node(state: AgentState) -> dict:
     try:
         from improve import signals as _signals
         _signals.enqueue_for_distill(traj_id)
+        workflow_event("distill.trajectory_enqueued", trajectoryId=traj_id)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Stage4 enqueue distill failed: {e}")
+        workflow_event("distill.trajectory_enqueue_failed", level=logging.WARNING, error=str(e))
 
     # 【注意】Piggyback kick 已统一放在 signals.enqueue_for_distill 里
     # （检查 piggyback_should_run → 节流 → create_task），避免入队和 kick 分散在两个模块。
@@ -698,5 +783,4 @@ async def log_trajectory_node(state: AgentState) -> dict:
             logger.error(f"Playbook reflection failed: {e}")
 
     return {"trajectory_id": traj_id}
-
 

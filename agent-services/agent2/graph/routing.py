@@ -7,6 +7,7 @@ LangGraph 条件路由。
 """
 from core.config import config
 from graph.utils import _sv
+from core.observability import workflow_event
 
 
 def should_hitl(state) -> str:
@@ -24,20 +25,25 @@ def should_hitl(state) -> str:
     hitl_count = _sv(state, "hitl_count", 0) or 0
 
     if hitl_needed and hitl_count <= 1:
+        workflow_event("graph.routed", fromNode="evaluate", route="interrupt", evaluation=evaluation)
         return "interrupt"
 
     # 2. sufficient（或 HITL 过了兜底 sufficient）→ generate
     if evaluation == "sufficient":
+        workflow_event("graph.routed", fromNode="evaluate", route="generate", evaluation=evaluation)
         return "generate"
 
     # 3. insufficient → relax（规则放宽），但最多执行一次，这里再用 iteration_count 兜底
     #    如果 iteration_count 已经到 MAX（说明循环异常，但 evaluate 规则理论不会出现）→ 强制 generate 保底
     if evaluation == "insufficient":
         if iteration_count >= config.AGENT2_MAX_ITERATIONS:
+            workflow_event("graph.routed", fromNode="evaluate", route="generate", evaluation=evaluation, reason="max_iterations")
             return "generate"
+        workflow_event("graph.routed", fromNode="evaluate", route="relax", evaluation=evaluation)
         return "relax"
 
     # 4. 异常兜底（hitl_needed=False 但 evaluation=hitl_needed 的脏数据场景）→ 保底 generate
+    workflow_event("graph.routed", fromNode="evaluate", route="generate", evaluation=evaluation, reason="fallback")
     return "generate"
 
 

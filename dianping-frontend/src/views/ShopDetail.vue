@@ -328,8 +328,6 @@ import VoucherCard from '@/components/voucher/VoucherCard.vue'
 import { shopApi } from '@/api/shop'
 import { voucherApi } from '@/api/voucher'
 import { voucherOrderApi } from '@/api/voucherOrder'
-import { paymentApi } from '@/api/payment'
-import { orderApi } from '@/api/order'
 import { blogApi } from '@/api/blog'
 import { agent1Api } from '@/api/agent'
 import type { Shop, Voucher, Blog, ReviewSummary } from '@/types'
@@ -409,19 +407,6 @@ async function loadReviewSummary() {
   }
 }
 
-async function waitOrderReady(orderId: number, maxTimes = 8, intervalMs = 500): Promise<void> {
-  for (let i = 0; i < maxTimes; i++) {
-    try {
-      const res = await orderApi.queryById(orderId)
-      const detail = (res.data as any) || {}
-      if (!detail.pending) return
-    } catch (e) {
-      // ignore
-    }
-    await new Promise(resolve => setTimeout(resolve, intervalMs))
-  }
-}
-
 async function handleSeckill(voucherId: number) {
   if (!userStore.isLoggedIn) {
     router.push({ path: '/login', query: { redirect: route.fullPath } })
@@ -431,18 +416,9 @@ async function handleSeckill(voucherId: number) {
     await ElMessageBox.confirm('确定要抢购该秒杀优惠券吗？', '确认抢购', {
       type: 'warning'
     })
-    const res = await voucherOrderApi.seckillVoucher(voucherId)
-    const orderId = res.data as number
-    ElMessage.success('抢购成功！正在完成订单创建...')
-    try {
-      await waitOrderReady(orderId)
-      await paymentApi.pay({ orderId, payType: 1 })
-      ElMessage.success('支付成功！')
-      router.push('/orders')
-    } catch (e) {
-      ElMessage.warning('请前往订单页面完成支付')
-      router.push('/orders')
-    }
+    await voucherOrderApi.seckillVoucher(voucherId)
+    ElMessage.success('抢购成功，请前往订单页完成支付')
+    router.push('/orders')
   } catch (e) {
     // cancelled or error
   }

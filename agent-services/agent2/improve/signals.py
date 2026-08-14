@@ -27,6 +27,7 @@ from typing import Any
 from core.config import config
 from core.redis import get_redis
 from core.models import TrajectoryRecord
+from core.observability import workflow_event
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,11 @@ def enqueue_for_distill(trajectory_id: str, schedule_piggyback: bool = True) -> 
     now = int(time.time())
     r.zadd(PENDING_ZSET, {trajectory_id: now})
     r.expire(PENDING_ZSET, PROCESSED_TTL)
+    workflow_event(
+        "distill.enqueued",
+        trajectoryId=trajectory_id,
+        schedulePiggyback=schedule_piggyback,
+    )
 
     if schedule_piggyback and piggyback_should_run():
         # fire-and-forget：不等待，不 catch；worker 内部自己处理异常并记录日志
@@ -61,6 +67,7 @@ def enqueue_for_distill(trajectory_id: str, schedule_piggyback: bool = True) -> 
             if loop.is_running():
                 from improve.worker import piggyback_scan  # 延迟 import 避免循环
                 loop.create_task(piggyback_scan())
+                workflow_event("distill.piggyback_scheduled", trajectoryId=trajectory_id)
         except RuntimeError:
             # 无运行中的 event loop（例如测试/脚本）——跳过，等 daemon loop 兜底
             pass
@@ -187,6 +194,11 @@ async def _distill_daemon_loop(
         "Piggyback (30s throttle, ≤4 per request) 先跑，本循环作为兜底。",
         interval_seconds, batch_size,
     )
+    workflow_event(
+        "distill.daemon_started",
+        intervalSeconds=interval_seconds,
+        batchSize=batch_size,
+    )
     while True:
         try:
             stats = await process_pending_batch(max_items=batch_size, min_cool_seconds=MIN_COOL_SECONDS)
@@ -199,9 +211,11 @@ async def _distill_daemon_loop(
                 )
         except asyncio.CancelledError:
             logger.info("[distill] daemon stopped (cancelled).")
+            workflow_event("distill.daemon_stopped")
             return
         except Exception as e:  # noqa: BLE001
             logger.error("[distill] daemon tick failed (will retry after %ds): %s", interval_seconds, e)
+            workflow_event("distill.daemon_tick_failed", level=logging.ERROR, errorType=type(e).__name__, error=str(e))
         await asyncio.sleep(interval_seconds)
 
 
@@ -240,4 +254,3 @@ def cancel_distill_daemon(app: Any) -> None:
     t = getattr(app.state, _DAEMON_TASK_KEY, None)
     if t and not t.done():
         t.cancel()
-

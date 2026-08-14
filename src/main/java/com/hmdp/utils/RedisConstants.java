@@ -20,6 +20,8 @@ public class RedisConstants {
      * 完整key: seckill:order:{voucherId}
      */
     public static final String SECKILL_ORDER_KEY = "seckill:order:";
+    public static final String SECKILL_ORDER_STREAM_KEY = "stream.orders";
+    public static final String SECKILL_ORDER_STREAM_GROUP = "g1";
 
     /**
      * 秒杀预订单（未完成落库的订单）缓存前缀 —— String，value=VoucherOrder JSON

@@ -6,6 +6,7 @@ import cn.hutool.core.util.StrUtil;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hmdp.document.ShopDoc;
 import com.hmdp.dto.Result;
+import com.hmdp.dto.ShopSearchResult;
 import com.hmdp.entity.Shop;
 import com.hmdp.repository.ShopDocRepository;
 import com.hmdp.service.IShopSearchService;
@@ -14,13 +15,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.elasticsearch.action.admin.indices.alias.IndicesAliasesRequest;
 import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
 import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
-import org.elasticsearch.action.admin.indices.mapping.put.PutMappingRequest;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
+import org.elasticsearch.client.Request;
 import org.elasticsearch.client.RequestOptions;
+import org.elasticsearch.client.Response;
 import org.elasticsearch.client.RestHighLevelClient;
 import org.elasticsearch.client.indices.GetIndexRequest;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.xcontent.XContentType;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -202,11 +203,15 @@ public class ElasticsearchConfiguration implements ApplicationRunner {
         boolean exists = client.indices().exists(new GetIndexRequest("shop"), RequestOptions.DEFAULT);
         summary.put("indexExistedBefore", exists);
 
-        if (exists && !force) {
+        if (exists && !force && hasShopMapping()) {
             summary.put("skipped", true);
             summary.put("reason", "索引已存在且 force=false，跳过重建。如需强制重建，请调用 POST /shop/search/rebuild-index 或将 elasticsearch.init.rebuild-on-startup=true 后重启。");
             warmUpCircuitBreaker();
             return summary;
+        }
+
+        if (exists && !force) {
+            log.warn("[ES] shop 索引已存在但 mapping 为空，补写 typeless mapping 并重新导入数据。");
         }
 
         if (exists && force) {
@@ -217,22 +222,30 @@ public class ElasticsearchConfiguration implements ApplicationRunner {
             }
             log.info("[ES] 删除完成。");
             summary.put("dropped", true);
+            exists = false;
         }
 
         Settings settings = buildIndexSettings();
         String mapping = buildMappingJson();
 
-        CreateIndexRequest createReq = new CreateIndexRequest("shop");
-        createReq.settings(settings);
-        AcknowledgedResponse cr = client.indices().create(createReq, RequestOptions.DEFAULT);
-        if (!cr.isAcknowledged()) throw new IllegalStateException("创建 shop 索引失败（未 ACK）");
-        log.info("[ES] 创建 shop 索引成功，开始写入 mapping（含同义词 graph + IK 双 analyzer）…");
-        summary.put("created", true);
+        if (!exists) {
+            CreateIndexRequest createReq = new CreateIndexRequest("shop");
+            createReq.settings(settings);
+            AcknowledgedResponse cr = client.indices().create(createReq, RequestOptions.DEFAULT);
+            if (!cr.isAcknowledged()) throw new IllegalStateException("创建 shop 索引失败（未 ACK）");
+            log.info("[ES] 创建 shop 索引成功，开始写入 mapping（含同义词 graph + IK 双 analyzer）…");
+            summary.put("created", true);
+        }
 
-        PutMappingRequest pmReq = new PutMappingRequest("shop");
-        pmReq.source(mapping, XContentType.JSON);
-        AcknowledgedResponse pm = client.indices().putMapping(pmReq, RequestOptions.DEFAULT);
-        if (!pm.isAcknowledged()) throw new IllegalStateException("写入 mapping 失败（未 ACK）");
+        // The Boot 2.3 bundled high-level client validates the removed mapping
+        // type locally. Send the typeless ES 7 request through its low-level API.
+        Request mappingRequest = new Request("PUT", "/shop/_mapping");
+        mappingRequest.setJsonEntity(mapping);
+        Response mappingResponse = client.getLowLevelClient().performRequest(mappingRequest);
+        int mappingStatus = mappingResponse.getStatusLine().getStatusCode();
+        if (mappingStatus < 200 || mappingStatus >= 300) {
+            throw new IllegalStateException("写入 mapping 失败，HTTP status=" + mappingStatus);
+        }
         log.info("[ES] mapping 写入成功。开始从 MySQL 导入 tb_shop 全量数据…");
         summary.put("mappingApplied", true);
 
@@ -241,6 +254,20 @@ public class ElasticsearchConfiguration implements ApplicationRunner {
         warmUpCircuitBreaker();
         summary.put("circuitBreakerWarmed", true);
         return summary;
+    }
+
+    /**
+     * 判断已有索引是否已经写入字段 mapping。旧版本客户端可能在 put mapping
+     * 本地校验阶段失败，留下 settings 已创建但 mappings 为空的索引。
+     */
+    private boolean hasShopMapping() throws IOException {
+        Response response = client.getLowLevelClient().performRequest(new Request("GET", "/shop/_mapping"));
+        try (InputStream in = response.getEntity().getContent()) {
+            com.fasterxml.jackson.databind.JsonNode root = new ObjectMapper().readTree(in);
+            com.fasterxml.jackson.databind.JsonNode properties = root.path("shop")
+                    .path("mappings").path("properties");
+            return properties.isObject() && properties.size() > 0;
+        }
     }
 
     /**
@@ -309,13 +336,12 @@ public class ElasticsearchConfiguration implements ApplicationRunner {
      * 手动调一次带空 keyword 的搜索（内部会走 ES 分支），让熔断器滑动窗口记录一次 success，
      * 避免首次真实请求遇到熔断器初始化相关的问题。
      */
-    @SuppressWarnings("unchecked")
     private void warmUpCircuitBreaker() {
         try {
             Result r = shopSearchService.search("杭州", null, null, 1, 1);
             Object data = r.getData();
-            long total = 0;
-            if (data instanceof java.util.Map) total = ((Number) ((java.util.Map<String, Object>) data).getOrDefault("total", 0L)).longValue();
+            long total = data instanceof ShopSearchResult
+                    ? ((ShopSearchResult) data).getTotal() : 0L;
             log.info("[ES] 熔断器预热：搜索 keyword=杭州 命中 {} 条（OK）。", total);
         } catch (Exception e) {
             // fallback 到 MySQL，也 OK —— 这里只是为了初始化 CircuitBreaker 内部状态机

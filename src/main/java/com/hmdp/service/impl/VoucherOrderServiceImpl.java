@@ -9,9 +9,14 @@ import com.hmdp.dto.PaymentDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Voucher;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.entity.SeckillVoucher;
+import com.hmdp.entity.TransactionOutbox;
+import com.hmdp.enums.OrderCreationResult;
 import com.hmdp.enums.OrderStatus;
 import com.hmdp.enums.PayType;
 import com.hmdp.mapper.VoucherOrderMapper;
+import com.hmdp.mapper.TransactionOutboxMapper;
+import com.hmdp.listener.TransactionOutboxPublisher;
 import com.hmdp.service.IPaymentService;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
@@ -36,6 +41,10 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.interceptor.TransactionAspectSupport;
+import org.springframework.dao.DuplicateKeyException;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
@@ -95,6 +104,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private RedissonClient redissonClient;
 
+    @Resource
+    private TransactionOutboxMapper outboxMapper;
+
+    private final TransactionTemplate transactionTemplate;
+
+    public VoucherOrderServiceImpl(PlatformTransactionManager transactionManager) {
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
+    }
+
     /**
      * 支付服务 —— 【八股：循环依赖问题】
      * VoucherOrderServiceImpl依赖IPaymentService，PaymentServiceImpl又依赖VoucherOrderServiceImpl
@@ -131,10 +149,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * - 替代方案：用分布式锁也能实现，但性能不如Lua，Lua是天然互斥
      */
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+    private static final DefaultRedisScript<Long> RESTORE_SECKILL_SCRIPT;
     static {
         SECKILL_SCRIPT=new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
         SECKILL_SCRIPT.setResultType(Long.class);
+        RESTORE_SECKILL_SCRIPT = new DefaultRedisScript<>();
+        RESTORE_SECKILL_SCRIPT.setLocation(new ClassPathResource("restore-seckill.lua"));
+        RESTORE_SECKILL_SCRIPT.setResultType(Long.class);
     }
 
 //    //阻塞队列，线程从中获取时，如果为空，则线程阻塞
@@ -261,25 +283,20 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * - Redisson：功能完善，生产环境首选
      * - Zookeeper：强一致性但性能不如Redis，适合并发不是特别高但对一致性要求高的场景
      */
-        public void handleVoucherOrder(VoucherOrder voucherOrder) {
+        public OrderCreationResult handleVoucherOrder(VoucherOrder voucherOrder) {
             //1.获取用户
             Long userId = voucherOrder.getUserId();
             //2.创建锁对象 —— 【八股：锁的粒度为什么是userId而不是voucherId？】
             // 一人一单：同一用户不能重复下单，所以锁的粒度是用户
             // 如果锁voucherId，那不同用户之间也会互斥，吞吐量大大降低
             // 锁粒度越小越好，能锁住目标即可，不要扩大范围
-            RLock lock = redissonClient.getLock("lock:order:" + userId);
+            RLock lock = redissonClient.getLock(
+                    "lock:order:" + userId + ":" + voucherOrder.getVoucherId());
             //3.获取锁 —— 【八股：tryLock() vs lock()】
             // tryLock()：尝试获取锁，获取失败立即返回false，不会阻塞
             // lock()：阻塞等待，直到获取到锁
             // 秒杀场景用tryLock，因为用户不需要等待，抢不到直接提示即可
-            boolean isLock = lock.tryLock();
-            //4.判断是否获取锁成功
-            if(!isLock) {
-                //失败，返回错误或重试
-               log.error("不允许重复下单");
-               return;
-            }
+            lock.lock();
             try {
                 //直接调用，不会触发spring aop的事务管理
                 //要通过代理调用，获取代理对象，才会被spring aop拦截
@@ -290,14 +307,16 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 // 3. 异常被try-catch吃掉了：Spring只在抛出未捕获异常时才回滚
                 // 4. 数据库引擎不支持事务：比如MyISAM
                 // 5. 多线程环境：事务和连接绑定在ThreadLocal，不同线程用不同连接
-                proxy.createVoucherOrder(voucherOrder);
+                return proxy.createVoucherOrder(voucherOrder);
             } catch (IllegalStateException e) {
                 throw new RuntimeException(e);
             }finally {
                 //释放锁 —— 【八股：为什么要在finally释放锁？】
                 // 防止业务代码抛出异常导致锁无法释放，造成死锁
                 // 即使有过期时间兜底，也应该主动释放，减少锁持有时间
-                lock.unlock();
+                if (lock.isHeldByCurrentThread()) {
+                    lock.unlock();
+                }
             }
         }
     private IVoucherOrderService proxy;
@@ -319,6 +338,22 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     public Result seckillVoucher(Long voucherId) {
         //获取用户id
         Long userId = UserHolder.getUser().getId();
+        SeckillVoucher seckillVoucher = seckillVoucherService.getById(voucherId);
+        if (seckillVoucher == null) {
+            return Result.fail("秒杀券不存在");
+        }
+        Voucher voucher = voucherService.getById(voucherId);
+        if (voucher == null || voucher.getPayValue() == null || voucher.getPayValue() <= 0) {
+            return Result.fail("优惠券支付金额异常");
+        }
+        LocalDateTime now = LocalDateTime.now();
+        if (seckillVoucher.getBeginTime() == null || seckillVoucher.getBeginTime().isAfter(now)) {
+            return Result.fail("秒杀尚未开始");
+        }
+        if (seckillVoucher.getEndTime() == null || !seckillVoucher.getEndTime().isAfter(now)) {
+            return Result.fail("秒杀已经结束");
+        }
+        ensureRedisStock(voucherId, seckillVoucher.getStock());
         //获取订单id —— 【八股：RedisIdWorker分布式ID生成器】
         // 为什么不用数据库自增ID？
         // 1. 分库分表后自增ID会重复
@@ -326,6 +361,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         // 雪花算法：1位符号位 + 41位时间戳 + 5位机房ID + 5位机器ID + 12位序列号
         // 本项目用Redis实现：时间戳 + 自增序列号
         long orderId = redisIdWorker.nextId("order");
+        VoucherOrder order = new VoucherOrder();
+        order.setId(orderId);
+        order.setUserId(userId);
+        order.setVoucherId(voucherId);
+        order.setStatus(OrderStatus.UNPAID.getCode());
+        order.setAmount(voucher.getPayValue());
+        order.setCreateTime(now);
+        String jsonStr = JSONUtil.toJsonStr(order);
+        long epochSec = now.atZone(java.time.ZoneId.systemDefault()).toEpochSecond();
 
         //1.执行lua脚本 —— 【八股：为什么Lua脚本可以保证原子性？】
         // Redis是单线程模型，执行命令是串行的
@@ -335,54 +379,23 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         Long result = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
                 Collections.emptyList(),
-                voucherId.toString(), userId.toString(),String.valueOf(orderId)
+                voucherId.toString(), userId.toString(), String.valueOf(orderId), jsonStr,
+                String.valueOf(epochSec),
+                String.valueOf(java.util.concurrent.TimeUnit.MINUTES.toSeconds(
+                        RedisConstants.SECKILL_PENDING_ORDER_TTL)),
+                order.getAmount().toString()
         );
         //2.判断结果是否为0
-        int r = 0;
-        if (result != null) {
-            r = result.intValue();
+        if (result == null) {
+            return Result.fail("秒杀服务异常，请稍后重试");
         }
+        int r = result.intValue();
         if(r!=0){
             //2.1.不为0，代表没有购买资格
+            if (r == -1) return Result.fail("秒杀库存尚未初始化");
             return Result.fail(r==1?"库存不足":"不能重复下单");
         }
-
-        // 2. 脱离请求线程，发消息给 RabbitMQ
-        VoucherOrder order = new VoucherOrder();
-        order.setId(orderId);
-        order.setUserId(userId);
-        order.setVoucherId(voucherId);
-        // 【八股：设置订单初始状态】
-        // 秒杀成功后订单状态为"未支付"，等待用户发起支付
-        // createTime在发送MQ消息前设置，确保落库时有值
-        order.setStatus(OrderStatus.UNPAID.getCode());
-        order.setCreateTime(LocalDateTime.now());
-        String jsonStr = JSONUtil.toJsonStr(order);
-        try {
-            rabbitTemplate.convertAndSend("X","XA",jsonStr );
-        } catch (Exception e) {
-            log.error("发送 RabbitMQ 消息失败，订单ID: {}", orderId, e);
-            throw new RuntimeException("发送消息失败");
-        }
-
-        // 3. 写 Redis pending 预订单缓存（解决"下单后立刻点支付/取消 → 订单不存在"）
-        //    - 用户维度索引 ZSet：score = createTime epoch 秒，用于"我的订单"按时间排序
-        //    - 订单维度 String：保存完整订单 JSON，支付/取消/详情/超时取消都能从此处捞
-        try {
-            String pendingKey = RedisConstants.SECKILL_PENDING_ORDER_KEY + orderId;
-            stringRedisTemplate.opsForValue().set(pendingKey, jsonStr,
-                    RedisConstants.SECKILL_PENDING_ORDER_TTL, java.util.concurrent.TimeUnit.MINUTES);
-
-            String userPendingKey = RedisConstants.SECKILL_PENDING_USER_KEY + userId;
-            long epochSec = order.getCreateTime().toEpochSecond(java.time.ZoneOffset.ofHours(8));
-            stringRedisTemplate.opsForZSet().add(userPendingKey, String.valueOf(orderId), epochSec);
-            stringRedisTemplate.expire(userPendingKey,
-                    RedisConstants.SECKILL_PENDING_USER_TTL, java.util.concurrent.TimeUnit.MINUTES);
-        } catch (Exception e) {
-            log.warn("写入 pending 预订单缓存失败，orderId={}", orderId, e);
-        }
-
-        // 4. 返回订单号给前端（实际下单异步处理）
+        // Redis Lua 已原子写入预订单和订单事件，异步消费者负责落库。
         return Result.ok(orderId);
     }
 
@@ -497,10 +510,23 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 注意：必须通过代理对象调用，否则事务不生效
      */
     @Transactional
-    public void createVoucherOrder(VoucherOrder voucherOrder) {
+    public OrderCreationResult createVoucherOrder(VoucherOrder voucherOrder) {
+        VoucherOrder existing = getById(voucherOrder.getId());
+        if (existing != null) {
+            evictPendingOrder(voucherOrder.getId(), voucherOrder.getUserId());
+            return OrderCreationResult.ALREADY_PROCESSED;
+        }
         // 【八股：设置订单初始状态】
         // 确保订单落库时状态为未支付、时间已记录
         voucherOrder.setStatus(OrderStatus.UNPAID.getCode());
+        voucherOrder.setActiveFlag(1);
+        if (voucherOrder.getAmount() == null || voucherOrder.getAmount() <= 0) {
+            Voucher voucher = voucherService.getById(voucherOrder.getVoucherId());
+            if (voucher == null || voucher.getPayValue() == null || voucher.getPayValue() <= 0) {
+                throw new IllegalStateException("优惠券支付金额异常");
+            }
+            voucherOrder.setAmount(voucher.getPayValue());
+        }
         if (voucherOrder.getCreateTime() == null) {
             voucherOrder.setCreateTime(LocalDateTime.now());
         }
@@ -527,7 +553,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             if (count > 0) {
                 //用户已经购买过了
                 log.error("用户已经购买过一次了（仍存在 UNPAID/PAID/USED/REFUNDING 的有效单）");
-                return;
+                return OrderCreationResult.ACTIVE_ORDER_EXISTS;
             }
             //扣减库存 —— 【八股：乐观锁防止超卖的核心代码】
             // set stock = stock - 1 扣减库存
@@ -543,12 +569,20 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     .update();
             if (!success) {
                 log.error("库存不足");
-                return ;
+                return OrderCreationResult.OUT_OF_STOCK;
             }
 
-            save(voucherOrder);
+            try {
+                if (!save(voucherOrder)) {
+                    throw new IllegalStateException("订单保存失败");
+                }
+            } catch (DuplicateKeyException duplicate) {
+                TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+                return OrderCreationResult.ACTIVE_ORDER_EXISTS;
+            }
             // 落库成功后清理 pending 缓存（DB 为真源，缓存只掩盖异步窗口期）
             evictPendingOrder(voucherOrder.getId(), userId);
+            return OrderCreationResult.CREATED;
     }
 
     // ==================== 交易闭环模块新增方法 ====================
@@ -570,16 +604,92 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 即使DB恢复失败，Redis已经恢复了，用户可以下单
      * DB恢复失败可以通过对账补偿
      */
-    private void restoreStockAndOrderRecord(Long voucherId, Long userId) {
-        // 1. 恢复Redis库存 —— INCR是原子操作，线程安全
-        stringRedisTemplate.opsForValue().increment(RedisConstants.SECKILL_STOCK_KEY + voucherId);
-        // 2. 恢复DB库存 —— 乐观更新，stock+1
-        seckillVoucherService.update()
-                .setSql("stock = stock + 1")
-                .eq("voucher_id", voucherId)
-                .update();
-        // 3. 删除一人一单记录 —— SREM移除Set中的userId
-        stringRedisTemplate.opsForSet().remove(RedisConstants.SECKILL_ORDER_KEY + voucherId, userId.toString());
+    private void restoreRedisReservation(Long orderId, Long voucherId, Long userId,
+                                         boolean restoreRedisStock,
+                                         boolean releaseQualification) {
+        SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+        if (voucher == null || voucher.getStock() == null) {
+            throw new IllegalStateException("恢复Redis秒杀库存失败，秒杀券不存在或库存为空: " + voucherId);
+        }
+        Long restored = executeRestoreScript(orderId, voucherId, userId,
+                restoreRedisStock, releaseQualification, voucher.getStock());
+        if (restored == null) {
+            throw new IllegalStateException("恢复Redis秒杀预占失败: orderId=" + orderId);
+        }
+    }
+
+    private Long executeRestoreScript(Long orderId, Long voucherId, Long userId,
+                                      boolean restoreRedisStock,
+                                      boolean releaseQualification,
+                                      Integer databaseStock) {
+        return stringRedisTemplate.execute(
+                RESTORE_SECKILL_SCRIPT,
+                Collections.emptyList(),
+                voucherId.toString(), userId.toString(), orderId.toString(),
+                restoreRedisStock ? "1" : "0",
+                releaseQualification ? "1" : "0",
+                databaseStock.toString()
+        );
+    }
+
+    private void ensureRedisStock(Long voucherId, Integer stock) {
+        if (stock == null || stock < 0) {
+            throw new IllegalStateException("秒杀库存异常");
+        }
+        stringRedisTemplate.opsForValue().setIfAbsent(
+                RedisConstants.SECKILL_STOCK_KEY + voucherId, stock.toString());
+    }
+
+    private void restoreStockAndOrderRecord(Long orderId, Long voucherId, Long userId,
+                                            boolean restoreDatabaseStock) {
+        restoreRedisReservation(orderId, voucherId, userId, true, true);
+        if (restoreDatabaseStock) {
+            boolean updated = seckillVoucherService.update()
+                    .setSql("stock = stock + 1")
+                    .eq("voucher_id", voucherId)
+                    .update();
+            if (!updated) {
+                throw new IllegalStateException("恢复数据库库存失败");
+            }
+        }
+    }
+
+    private void saveRedisCompensationEvent(VoucherOrder order) {
+        TransactionOutbox event = new TransactionOutbox();
+        event.setEventKey("redis-compensation:" + order.getId());
+        event.setEventType(TransactionOutboxPublisher.REDIS_COMPENSATION);
+        event.setAggregateId(order.getId());
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("id", order.getId());
+        payload.put("userId", order.getUserId());
+        payload.put("voucherId", order.getVoucherId());
+        event.setPayload(JSONUtil.toJsonStr(payload));
+        event.setStatus(0);
+        event.setRetryCount(0);
+        event.setNextRetryTime(LocalDateTime.now());
+        event.setCreateTime(LocalDateTime.now());
+        event.setUpdateTime(LocalDateTime.now());
+        try {
+            outboxMapper.insert(event);
+        } catch (DuplicateKeyException duplicate) {
+            log.debug("Redis补偿事件已存在: orderId={}", order.getId());
+        }
+    }
+
+    private void tryRedisCompensation(VoucherOrder order) {
+        try {
+            restoreStockAndOrderRecord(
+                    order.getId(), order.getVoucherId(), order.getUserId(), false);
+        } catch (RuntimeException e) {
+            log.warn("Redis补偿暂时失败，等待Outbox重试: orderId={}", order.getId(), e);
+        }
+    }
+
+    @Override
+    public void releaseRejectedReservation(VoucherOrder order, boolean restoreRedisStock,
+                                           boolean releaseQualification) {
+        restoreRedisReservation(order.getId(), order.getVoucherId(), order.getUserId(),
+                restoreRedisStock, releaseQualification);
     }
 
     /**
@@ -615,6 +725,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         VoucherOrder order = getOrderWithPending(orderId);
         if (order == null) {
             return Result.fail("订单不存在");
+        }
+        Long currentUserId = UserHolder.getUser().getId();
+        if (!currentUserId.equals(order.getUserId())) {
+            return Result.fail("无权查看他人订单");
         }
         // 2. 查询优惠券信息
         Voucher voucher = voucherService.getById(order.getVoucherId());
@@ -720,7 +834,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 手动取消订单
      */
     @Override
-    @Transactional
     public Result cancelOrder(Long orderId) {
         // 1. 使用 DB+pending 统一入口（解决异步落库窗口下"订单不存在"）
         VoucherOrder order = getOrderWithPending(orderId);
@@ -732,58 +845,18 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         if (!order.getUserId().equals(userId)) {
             return Result.fail("无权操作他人订单");
         }
-        // 3. 状态机校验：UNPAID → CANCELLED
-        OrderStatus currentStatus = OrderStatus.of(order.getStatus());
-        if (!currentStatus.canTransitionTo(OrderStatus.CANCELLED)) {
-            return Result.fail("当前订单状态不允许取消: " + currentStatus.getDesc());
-        }
-
-        // 4. 如果是 pending 订单（还没写入 DB）—— 先写一张「终态已取消」的 DB 占位行，再做 Redis 回滚。
-        //    【为什么不直接只清 Redis？】
-        //    MQ（QA / 死信 QD）的消费可能比 cancelOrder 晚几十 ms 甚至几分钟：
-        //    直接只清 Redis → cancelOrder 成功返回 → 但之后异步的 handleVoucherOrder 里仍然会
-        //    save(UNPAID) 到 DB → DB 多一条"幽灵 UNPAID" → 该用户下次秒杀进入 createVoucherOrder
-        //    时，SQL count(status ∈ {UNPAID/PAID/VERIFIED/REFUNDING}) > 0 → 被静默拦 → 新订单
-        //    永远 pending → 前端"订单创建中 / 用户已经购买过一次了"。
-        //    解决：先用 PK 同 orderId 持久化一张 status=CANCELLED 的 DB 行到真源里（行锁/唯一约束原子），
-        //    后续异步 save(UNPAID) 会被 DB UNIQUE(order.id) 与 MyBatis-Plus save 的 0 行更新安全兜底，
-        //    状态不会再回滚成 UNPAID。
-        VoucherOrder dbOrder = getById(orderId);
-        if (dbOrder == null) {
-            try {
-                VoucherOrder cancelledRow = new VoucherOrder();
-                cancelledRow.setId(orderId);
-                cancelledRow.setUserId(userId);
-                cancelledRow.setVoucherId(order.getVoucherId());
-                cancelledRow.setStatus(OrderStatus.CANCELLED.getCode());
-                cancelledRow.setCreateTime(order.getCreateTime() != null ? order.getCreateTime() : LocalDateTime.now());
-                cancelledRow.setUpdateTime(LocalDateTime.now());
-                boolean saved = save(cancelledRow);
-                if (!saved) {
-                    // 罕见：主键冲突兜底（并发取消），再次 getById 检查 DB 是否已存在 CANCELLED
-                    log.warn("pending订单写CANCELLED占位失败（可能主键冲突），orderId={}", orderId);
-                    dbOrder = getById(orderId);
-                    if (dbOrder == null) {
-                        return Result.fail("取消订单失败，请稍后再试");
-                    }
-                } else {
-                    log.info("pending订单取消：先写 DB CANCELLED 占位，orderId={}, userId={}", orderId, userId);
-                }
-                restoreStockAndOrderRecord(order.getVoucherId(), userId);
-            } catch (Exception e) {
-                log.warn("pending订单取消时恢复库存失败，orderId={}", orderId, e);
-                return Result.fail("取消订单失败，请稍后再试");
+        CancellationOutcome outcome = cancelInDatabase(order, true);
+        if (!outcome.cancelled) {
+            VoucherOrder latest = getById(orderId);
+            if (latest != null && latest.getStatus() == OrderStatus.CANCELLED.getCode()) {
+                saveRedisCompensationEvent(latest);
+                tryRedisCompensation(latest);
+                return Result.ok();
             }
-            evictPendingOrder(orderId, userId);
-            return Result.ok();
+            String status = latest == null ? "未知" : OrderStatus.of(latest.getStatus()).getDesc();
+            return Result.fail("当前订单状态不允许取消: " + status);
         }
-
-        // 5. 已经写入 DB 的订单：更新状态 + 恢复库存
-        dbOrder.setStatus(OrderStatus.CANCELLED.getCode());
-        dbOrder.setUpdateTime(LocalDateTime.now());
-        updateById(dbOrder);
-        // 6. 恢复库存和一人一单记录 + 清 pending
-        restoreStockAndOrderRecord(dbOrder.getVoucherId(), userId);
+        tryRedisCompensation(order);
         evictPendingOrder(orderId, userId);
         log.info("订单已手动取消，orderId={}, userId={}", orderId, userId);
         return Result.ok();
@@ -815,7 +888,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 所以这里直接从订单中获取userId，不做用户校验
      */
     @Override
-    @Transactional
     public void handleOrderTimeout(Long orderId) {
         // 1. 查询订单（DB 为空时再看 pending）——解决：异步落库延迟久 + 延迟队列早到 导致的"订单不存在"
         VoucherOrder order = getOrderWithPending(orderId);
@@ -823,34 +895,101 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.warn("超时取消失败，订单不存在: orderId={}", orderId);
             return;
         }
-        // 2. 检查订单是否仍为未支付状态
-        OrderStatus currentStatus = OrderStatus.of(order.getStatus());
-        if (currentStatus != OrderStatus.UNPAID) {
-            log.info("订单已不是未支付状态，跳过超时取消: orderId={}, status={}",
-                    orderId, currentStatus.getDesc());
-            return;
-        }
-
-        VoucherOrder dbOrder = getById(orderId);
-        if (dbOrder == null) {
-            // 还在 pending 未入 DB：直接回滚 Redis + 清 pending
-            try {
-                restoreStockAndOrderRecord(order.getVoucherId(), order.getUserId());
-            } catch (Exception e) {
-                log.warn("pending订单超时取消恢复库存失败，orderId={}", orderId, e);
+        CancellationOutcome outcome = cancelInDatabase(order, false);
+        if (!outcome.cancelled) {
+            VoucherOrder latest = getById(orderId);
+            if (latest != null && latest.getStatus() == OrderStatus.CANCELLED.getCode()) {
+                saveRedisCompensationEvent(latest);
+                tryRedisCompensation(latest);
             }
-            evictPendingOrder(orderId, order.getUserId());
-            log.info("pending订单超时取消（未入DB），orderId={}, userId={}", orderId, order.getUserId());
             return;
         }
+        tryRedisCompensation(order);
+        evictPendingOrder(orderId, order.getUserId());
+        log.info("订单超时自动取消成功: orderId={}, userId={}", orderId, order.getUserId());
+    }
 
-        // 3. 已经入 DB：更新订单状态为已取消
-        dbOrder.setStatus(OrderStatus.CANCELLED.getCode());
-        dbOrder.setUpdateTime(LocalDateTime.now());
-        updateById(dbOrder);
-        // 4. 恢复库存和一人一单记录 + 清 pending
-        restoreStockAndOrderRecord(dbOrder.getVoucherId(), dbOrder.getUserId());
-        evictPendingOrder(orderId, dbOrder.getUserId());
-        log.info("订单超时自动取消成功: orderId={}, userId={}", orderId, dbOrder.getUserId());
+    private CancellationOutcome cancelInDatabase(VoucherOrder order, boolean manual) {
+        return transactionTemplate.execute(status -> {
+            int changed = lambdaUpdate()
+                    .set(VoucherOrder::getStatus, OrderStatus.CANCELLED.getCode())
+                    .set(VoucherOrder::getActiveFlag, null)
+                    .set(VoucherOrder::getUpdateTime, LocalDateTime.now())
+                    .eq(VoucherOrder::getId, order.getId())
+                    .eq(VoucherOrder::getUserId, order.getUserId())
+                    .eq(VoucherOrder::getStatus, OrderStatus.UNPAID.getCode())
+                    .update() ? 1 : 0;
+            if (changed == 1) {
+                boolean stockUpdated = seckillVoucherService.update()
+                        .setSql("stock = stock + 1")
+                        .eq("voucher_id", order.getVoucherId())
+                        .update();
+                if (!stockUpdated) {
+                    throw new IllegalStateException("恢复数据库库存失败");
+                }
+                saveRedisCompensationEvent(order);
+                return new CancellationOutcome(true);
+            }
+
+            VoucherOrder current = getById(order.getId());
+            if (current != null) {
+                int changedAfterInsert = lambdaUpdate()
+                        .set(VoucherOrder::getStatus, OrderStatus.CANCELLED.getCode())
+                        .set(VoucherOrder::getActiveFlag, null)
+                        .set(VoucherOrder::getUpdateTime, LocalDateTime.now())
+                        .eq(VoucherOrder::getId, order.getId())
+                        .eq(VoucherOrder::getUserId, order.getUserId())
+                        .eq(VoucherOrder::getStatus, OrderStatus.UNPAID.getCode())
+                        .update() ? 1 : 0;
+                if (changedAfterInsert == 1) {
+                    boolean stockUpdated = seckillVoucherService.update()
+                            .setSql("stock = stock + 1")
+                            .eq("voucher_id", order.getVoucherId())
+                            .update();
+                    if (!stockUpdated) {
+                        throw new IllegalStateException("恢复数据库库存失败");
+                    }
+                    saveRedisCompensationEvent(order);
+                    return new CancellationOutcome(true);
+                }
+                return new CancellationOutcome(false);
+            }
+            if (order.getCreateTime() == null) {
+                order.setCreateTime(LocalDateTime.now());
+            }
+            int inserted = getBaseMapper().insertCancelledIfAbsent(
+                    order, OrderStatus.CANCELLED.getCode());
+            if (inserted == 1) {
+                saveRedisCompensationEvent(order);
+                return new CancellationOutcome(true);
+            }
+            boolean cancelledAfterConflict = lambdaUpdate()
+                    .set(VoucherOrder::getStatus, OrderStatus.CANCELLED.getCode())
+                    .set(VoucherOrder::getActiveFlag, null)
+                    .set(VoucherOrder::getUpdateTime, LocalDateTime.now())
+                    .eq(VoucherOrder::getId, order.getId())
+                    .eq(VoucherOrder::getUserId, order.getUserId())
+                    .eq(VoucherOrder::getStatus, OrderStatus.UNPAID.getCode())
+                    .update();
+            if (cancelledAfterConflict) {
+                boolean stockUpdated = seckillVoucherService.update()
+                        .setSql("stock = stock + 1")
+                        .eq("voucher_id", order.getVoucherId())
+                        .update();
+                if (!stockUpdated) {
+                    throw new IllegalStateException("恢复数据库库存失败");
+                }
+                saveRedisCompensationEvent(order);
+            }
+            return new CancellationOutcome(cancelledAfterConflict);
+        });
+    }
+
+    private static final class CancellationOutcome {
+        private final boolean cancelled;
+
+        private CancellationOutcome(boolean cancelled) {
+            this.cancelled = cancelled;
+        }
     }
 }
