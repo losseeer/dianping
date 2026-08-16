@@ -5,6 +5,7 @@ import logging
 import uuid
 import time
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.types import interrupt
 from core.config import config
 from core.llm import get_llm, call_llm
 from core.guard import guard_user_message, validate_tool_calls, truncate_review_summary, limit_candidates_for_prompt
@@ -289,7 +290,8 @@ async def evaluate_node(state: AgentState) -> dict:
     判定优先级：
       1. 已经 HITL 过 (hitl_count ≥ 1) → 强制 sufficient，不再打断用户（单轮最多一次 HITL 保证）
       2. 候选数 ≥ AGENT2_MIN_CANDIDATES 且执行过搜索 → sufficient
-      3. 候选数 = 0 且 hitl_count = 0 → hitl_needed（问用户补充条件）
+      2.5 执行过工具但还没搜索（如只调了 get_shop_types）且 iteration_count < 2 → replan（回 plan 闭环依赖）
+      3. 候选数 = 0 且 hitl_count = 0 → 图内 interrupt() 暂停等待用户反馈；resume 重放后转 feedback 路由
       4. 0 < 候选 < AGENT2_MIN_CANDIDATES 且 replan_count = 0 → insufficient（交给 Replan 放宽）
       5. 0 < 候选 < AGENT2_MIN_CANDIDATES 且 replan_count ≥ 1 → sufficient（放宽过仍少，硬推荐）
     """
@@ -308,7 +310,8 @@ async def evaluate_node(state: AgentState) -> dict:
     hitl_options: list[str] = []
     hitl_reason = ""
     next_tool_calls: list[dict] = []
-    hitl_needed_flag = False
+    user_feedback_value = ""
+    replan_hints_extra: list[str] = []
 
     # 规则 1：已经 HITL 过了，强制进入推荐，不再继续打断
     if hitl_count >= 1:
@@ -318,19 +321,27 @@ async def evaluate_node(state: AgentState) -> dict:
     elif has_searched and candidate_count >= min_candidates:
         evaluation = "sufficient"
         reasoning = f"候选数{candidate_count}≥{min_candidates}且已执行搜索，无需replan"
-    # 规则 3：候选为 0 → HITL（但单轮只触发一次）
+    # 规则 2.5：执行过预备性工具（如 get_shop_types）但还没真正搜索 → 回 plan 闭环依赖，不打断用户
+    elif state.tool_results and not has_searched and candidate_count == 0 and state.iteration_count < 2:
+        evaluation = "replan"
+        reasoning = "已执行预备性工具但尚未搜索（候选0）→ 携带工具结果回 plan 重新规划（iteration守卫：最多回一次）"
+        replan_hints_extra = [
+            "上一轮已执行预备性工具（见「已有的工具执行结果」），请基于其返回完成搜索："
+            "如已调 get_shop_types，则用返回的 typeId 调 search_shops_nearby"
+        ]
+    # 规则 3：候选为 0 → HITL 打断（能走到这里必然 hitl_count == 0，规则 1 已拦截打断过的情况）
     elif candidate_count == 0:
-        if hitl_count == 0:
-            evaluation = "hitl_needed"
-            hitl_needed_flag = True
-            reasoning = "候选数=0，hitl_count=0 → 触发HITL向用户询问补充条件"
-            hitl_reason = "没有找到符合条件的商铺"
-            # 规则化模板提问（不再靠 LLM 生成，避免抖动）
-            hitl_question = "抱歉，当前条件下没有找到合适的店。你愿意放宽哪一项呢？"
-            hitl_options = ["扩大搜索距离", "降低评分要求", "提高人均预算", "换个菜系/类别"]
-        else:
-            evaluation = "sufficient"
-            reasoning = "候选数=0但hitl_count>=1，硬兜底sufficient（空推荐说明情况）"
+        hitl_reason = "没有找到符合条件的商铺"
+        # 规则化模板提问（不再靠 LLM 生成，避免抖动）
+        hitl_question = "抱歉，当前条件下没有找到合适的店。你愿意放宽哪一项呢？"
+        hitl_options = ["扩大搜索距离", "降低评分要求", "提高人均预算", "换个菜系/类别"]
+        # 真正的图内 HITL：interrupt() 抛出 GraphInterrupt 暂停图执行，由 checkpointer 持久化。
+        # resume 时本节点确定性重放（规则逻辑重算结果相同），interrupt() 返回用户反馈，
+        # 随后走 feedback 分支路由到 update_memory。
+        feedback = interrupt({"question": hitl_question, "options": hitl_options, "reason": hitl_reason})
+        evaluation = "feedback"
+        reasoning = "HITL 已收到用户反馈（Command(resume)），转 update_memory 提取偏好后重新规划"
+        user_feedback_value = feedback if isinstance(feedback, str) else json.dumps(feedback, ensure_ascii=False)
     # 规则 4：0 < 候选 < min_candidates → 看 replan_count
     else:  # 0 < candidate_count < min_candidates
         if replan_count == 0:
@@ -361,7 +372,8 @@ async def evaluate_node(state: AgentState) -> dict:
         "reasoning": reasoning[:200],
         "prediction": (
             "generate" if evaluation == "sufficient"
-            else "interrupt(HITL)" if evaluation == "hitl_needed"
+            else "feedback→update_memory" if evaluation == "feedback"
+            else "replan(go-plan: 预备工具闭环)" if evaluation == "replan"
             else "replan(规则放宽)"
         ),
         "verified": None,
@@ -371,12 +383,16 @@ async def evaluate_node(state: AgentState) -> dict:
     }
     updates["decisions"] = state.decisions + [decision] if state.decisions else [decision]
 
-    if evaluation == "hitl_needed":
-        updates["hitl_needed"] = hitl_needed_flag  # 总是 True 这里，但保留表达式显式
+    if replan_hints_extra:
+        updates["replan_hints"] = (state.replan_hints or []) + replan_hints_extra
+
+    if evaluation == "feedback":
+        updates["user_feedback"] = user_feedback_value
+        updates["hitl_needed"] = False
+        updates["hitl_count"] = hitl_count + 1
         updates["hitl_question"] = hitl_question
         updates["hitl_options"] = hitl_options
         updates["hitl_reason"] = hitl_reason
-        updates["hitl_count"] = hitl_count + 1
     elif evaluation == "insufficient":
         # next_tool_calls 留空：Replan 逻辑改为 replan_relax_node 纯规则处理，不再依赖 evaluate 给工具列表
         updates["tool_calls"], _ = validate_tool_calls(next_tool_calls)
@@ -590,14 +606,8 @@ async def generate_recommendation_node(state: AgentState) -> dict:
                     "recommendation": result.get("recommendation"),
                 })
 
-    # ---- 提取 PLAN 阶段的 intent_analysis（若存在）----
+    # ---- 提取 PLAN 阶段的 intent_analysis（挂在 plan_node 写入的 decisions 里）----
     intent_analysis: dict = {}
-    for tr in state.tool_results:
-        # intent_analysis 一般写在 plan_node 的 tool_calls 之外，但有些版本会把解析结果挂在
-        # state.decisions 里；这里优先从 decisions 拿，其次 fallback 从 tool_calls 解析
-        pass
-    # Fallback：从最近一个 plan_node 的输出（通常是 state.plan）中的 JSON 解析，
-    # 但更稳的是在 plan_node 输出后直接挂 decisions；这里改用 state.decisions 中最近的一条 intent_analysis
     for decision in reversed(state.decisions or []):
         if isinstance(decision, dict) and "intent_analysis" in decision:
             intent_analysis = decision["intent_analysis"] or {}
@@ -771,16 +781,8 @@ async def log_trajectory_node(state: AgentState) -> dict:
 
     # 【注意】Piggyback kick 已统一放在 signals.enqueue_for_distill 里
     # （检查 piggyback_should_run → 节流 → create_task），避免入队和 kick 分散在两个模块。
-
-    # 评分低于阈值时触发 playbook 反思，蒸馏经验
-    if state.reflection_score > 0 and state.reflection_score < config.PLAYBOOK_REFLECTION_THRESHOLD:
-        try:
-            insights = await playbook.reflect(record)
-            if insights:
-                await playbook.curate(insights, source="reflection")
-                logger.info(f"Playbook updated with {len(insights)} insights from trajectory {traj_id}")
-        except Exception as e:
-            logger.error(f"Playbook reflection failed: {e}")
+    # 【2026-08 清理】原"低分触发 playbook.reflect"分支已删除：reflect 节点移出主路径后
+    # reflection_score 恒为 0，该分支永不触发；经验蒸馏统一由 improve/ 信号管线（Stage 4）负责。
 
     return {"trajectory_id": traj_id}
 

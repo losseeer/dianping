@@ -1,7 +1,10 @@
-"""Graph 工具：计时、state 辅助、JSON 解析"""
+"""Graph 工具：计时、state 辅助、JSON 解析、interrupt 载荷提取"""
 import json
 import time
 from functools import wraps
+from typing import Optional
+
+from langgraph.errors import GraphInterrupt
 
 from core.observability import workflow_event
 
@@ -10,6 +13,19 @@ def _sv(state, key, default=None):
     if isinstance(state, dict):
         return state.get(key, default)
     return getattr(state, key, default)
+
+
+def extract_hitl_interrupt(result: dict) -> Optional[dict]:
+    """从图执行结果中提取 HITL interrupt 载荷（evaluate 内 interrupt() 触发）；无中断返回 None。
+
+    LangGraph 中断时 ainvoke 返回值带 "__interrupt__" 键（Interrupt 对象列表），
+    被打断节点（evaluate）本轮写入未提交，故 hitl_* 字段需由调用方用本载荷合成。
+    """
+    for intr in (result or {}).get("__interrupt__") or []:
+        value = getattr(intr, "value", None)
+        if isinstance(value, dict) and value.get("question"):
+            return value
+    return None
 
 
 def timed_node(name: str):
@@ -27,6 +43,14 @@ def timed_node(name: str):
             )
             try:
                 result = await func(state)
+            except GraphInterrupt:
+                # 图内 HITL 暂停（evaluate 调 interrupt()）不是节点失败
+                workflow_event(
+                    "node.interrupted",
+                    node=name,
+                    durationMs=round((time.time() - start) * 1000, 1),
+                )
+                raise
             except Exception as exc:
                 workflow_event(
                     "node.failed",

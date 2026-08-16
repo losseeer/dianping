@@ -34,7 +34,7 @@ async def run_test():
     gn.execute_tool = _patched
 
     # ---- 导入核心模块 ----
-    from graph.builder import compiled_graph
+    from graph.builder import run_graph
     from graph.state import AgentState
     from memory.conversation import append_turn, get_context_summary, clear_conversation, save_last_shops
     from memory.preferences import load_memory
@@ -66,7 +66,7 @@ async def run_test():
     print(f"[经验]  {pb[:100]}")
 
     s1 = AgentState(user_message=msg1, user_id=user_id, user_x=x, user_y=y, thread_id=thread_id)
-    out1 = AgentState(**(await compiled_graph.ainvoke(s1.model_dump())))
+    out1 = AgentState(**(await run_graph(s1.model_dump())))
 
     print(f"\n>>> 结果: HITL={out1.hitl_needed}  候选={len(out1.candidate_shops)}  迭代={out1.iteration_count}")
     if out1.hitl_needed:
@@ -93,7 +93,7 @@ async def run_test():
     print(f"[会话]\n{conv2[:250]}\n")
 
     s2 = AgentState(user_message=msg2, user_id=user_id, user_x=x, user_y=y, thread_id=thread_id)
-    out2 = AgentState(**(await compiled_graph.ainvoke(s2.model_dump())))
+    out2 = AgentState(**(await run_graph(s2.model_dump())))
 
     mem2 = await load_memory(user_id)
     print(f"[记忆]  {json.dumps(mem2.get('preferences', {}), ensure_ascii=False)[:120]}")
@@ -121,7 +121,7 @@ async def run_test():
     print(f"[会话上下文 LLM压缩]\n{conv3[:300]}\n")
 
     s3 = AgentState(user_message=msg3, user_id=user_id, user_x=x, user_y=y, thread_id=thread_id)
-    out3 = AgentState(**(await compiled_graph.ainvoke(s3.model_dump())))
+    out3 = AgentState(**(await run_graph(s3.model_dump())))
 
     if out3.ranked_shops:
         for i, s in enumerate(out3.ranked_shops[:5], 1):

@@ -2,18 +2,30 @@
 LangGraph 状态图构建。
 
 【重构 2026-08】新图拓扑：
-  load_memory → plan → execute → evaluate → (interrupt / generate / relax)
+  load_memory → plan → execute → evaluate → (feedback / generate / relax / replan)
+    evaluate 命中 HITL 时图内 interrupt() 暂停（checkpointer 持久化线程状态），
+    Command(resume=用户反馈) 恢复后 evaluate 重放 → feedback 路由：
+    feedback → update_memory → plan  (提取偏好后重新规划)
     relax → replan_relax → evaluate  (规则放宽闭环，最多一轮：replan_count 守卫)
+    replan → plan  (预备性工具闭环，如 get_shop_types→search：携带工具结果回 plan，最多一轮：iteration_count 守卫)
     generate → log_trajectory → END
-    update_memory → plan  (HITL 用户反馈后重新规划)
+  update_memory 仅经 feedback 路由进入（图内可达），不再由 main.py 图外直调。
 
 Reflect 节点从主请求路径移除：不再串行等待 LLM 自评。
-旧 reflect_with_timing / should_replan 均已停用，如外部仍有直接符号 import（如 eval/runner 遗留兼容路径），
-请改用新的 signals/distill/worker 离线信号管线（improve/ 目录）。
+经验蒸馏统一走 improve/ 信号管线（Stage 4）。
 Replan 改为 replan_relax 纯规则节点，不调用 LLM，单轮最多一次。
+
+Checkpointer 说明：InMemorySaver 进程级保存（重启丢失）。
+HITL 的跨重启兜底：main.py 将打断时的快照另存 Redis（hitl.py），
+resume 时若 checkpointer 无该线程（服务重启过），用 Command(goto="update_memory") 从快照进图。
+生产环境如需跨重启的图内恢复，可替换为 Redis/Postgres 实现的 BaseCheckpointSaver。
 """
+import uuid
+
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import StateGraph, END
 from graph.state import AgentState
+from graph.utils import extract_hitl_interrupt
 from graph.nodes import (
     load_memory_node,
     plan_node,
@@ -45,19 +57,21 @@ def build_graph() -> StateGraph:
     graph.add_edge("load_memory", "plan")
     graph.add_edge("plan", "execute")
     graph.add_edge("execute", "evaluate")
-    graph.add_edge("update_memory", "plan")  # HITL 用户反馈写记忆后重新 plan
+    graph.add_edge("update_memory", "plan")  # feedback 路由进入：HITL 用户反馈提取偏好后重新 plan
 
-    # evaluate → 三路分叉
+    # evaluate → 四路分叉
     graph.add_conditional_edges(
         "evaluate",
         should_hitl,
         {
-            # HITL 打断：LangGraph interrupt/resume 机制，用户补充后从 update_memory 再进图
-            "interrupt": END,
+            # interrupt(resume) 后 evaluate 重放产生 → 提取偏好后重新规划
+            "feedback": "update_memory",
             # 候选充足或兜底 → 生成最终推荐
             "generate": "generate",
             # 0 < 候选 < MIN_CANDIDATES 且 replan_count=0 → 规则放宽重搜，回 evaluate 二次判定
             "relax": "replan_relax",
+            # 执行过预备性工具但还没搜索（候选0）→ 携带工具结果回 plan 闭环（iteration 守卫最多回一次）
+            "replan": "plan",
         },
     )
 
@@ -72,4 +86,27 @@ def build_graph() -> StateGraph:
     return graph
 
 
-compiled_graph = build_graph().compile()
+compiled_graph = build_graph().compile(checkpointer=InMemorySaver())
+
+
+async def run_graph(state_dict: dict) -> dict:
+    """统一图执行入口。
+
+    1. 以 thread_id 绑定 checkpointer（interrupt() 恢复依赖线程状态）
+    2. HITL 中断时把 interrupt 载荷规范化回 hitl_* 状态字段——被中断的 evaluate
+       本轮写入不会提交，调用方（main/eval/tests）仍可像以前一样读 state.hitl_needed /
+       hitl_question，无需感知 __interrupt__ 协议。
+    """
+    thread_id = state_dict.get("thread_id") or str(uuid.uuid4())
+    result = await compiled_graph.ainvoke(
+        state_dict, config={"configurable": {"thread_id": thread_id}}
+    )
+    payload = extract_hitl_interrupt(result)
+    normalized = {k: v for k, v in (result or {}).items() if k != "__interrupt__"}
+    if payload:
+        normalized["hitl_needed"] = True
+        normalized["hitl_question"] = payload.get("question", "")
+        normalized["hitl_options"] = payload.get("options") or []
+        normalized["hitl_reason"] = payload.get("reason", "")
+        normalized["hitl_count"] = (normalized.get("hitl_count") or 0) + 1
+    return normalized

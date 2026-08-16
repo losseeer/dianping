@@ -542,7 +542,7 @@ class EvalRunner:
 
     async def run_single_case_offline(self, case: EvalCase, judge: bool = True) -> dict:
         """离线运行单个用例（直接 import compiled_graph）"""
-        from graph.builder import compiled_graph
+        from graph.builder import run_graph
         from graph.state import AgentState
 
         start_time = time.time()
@@ -566,7 +566,7 @@ class EvalRunner:
                 user_x=case.x, user_y=case.y,
                 thread_id=f"eval-{uuid.uuid4().hex[:8]}",
             )
-            result_state = await compiled_graph.ainvoke(state.model_dump())
+            result_state = await run_graph(state.model_dump())
             st = AgentState(**result_state)
             elapsed = (time.time() - start_time) * 1000
             out["responseTimeMs"] = round(elapsed, 1)
@@ -904,7 +904,7 @@ class EvalRunner:
 
     async def run_multi_turn_scenario(self, scenario: ScenarioCase) -> dict:
         """运行多轮对话场景评测：验证指代解析、HITL 恢复、拼写容错"""
-        from graph.builder import compiled_graph
+        from graph.builder import run_graph
         from graph.state import AgentState
         from memory.conversation import append_turn, save_last_shops, clear_conversation
 
@@ -929,7 +929,7 @@ class EvalRunner:
                     user_message=step.content, user_id=user_id,
                     user_x=120.17, user_y=30.31, thread_id=thread_id,
                 )
-                result_state = await compiled_graph.ainvoke(state.model_dump())
+                result_state = await run_graph(state.model_dump())
                 st = AgentState(**result_state)
 
                 if st.hitl_needed:
@@ -1299,12 +1299,12 @@ async def _judge_playbook(entries):
 
 async def _run_single(msg, uid, x=120.17, y=30.31):
     """运行单次推荐并收集结果（含 LLM-Judge）"""
-    from graph.builder import compiled_graph
+    from graph.builder import run_graph
     from graph.state import AgentState
     import time
     state = AgentState(user_message=msg, user_id=uid, user_x=x, user_y=y,
                        thread_id=f"exp-{uid}-{int(time.time()*1000)}")
-    r = await compiled_graph.ainvoke(state.model_dump())
+    r = await run_graph(state.model_dump())
     st = AgentState(**r)
     shops = st.ranked_shops or []
     judge = await _llm_judge(msg, shops) if shops and not st.hitl_needed else {}

@@ -29,8 +29,8 @@ from eval.runner import eval_runner
 from memory.trajectory import trajectory_store
 from core.models import ChatRequest, ResumeRequest
 from graph.state import AgentState
-from graph.builder import compiled_graph
-from graph.nodes import update_memory_node
+from graph.builder import compiled_graph, run_graph
+from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ async def chat_endpoint(req: ChatRequest):
 
         reset_token_usage()
         workflow_event("graph.started", entryNode="load_memory")
-        result_state = await compiled_graph.ainvoke(initial_state.model_dump())
+        result_state = await run_graph(initial_state.model_dump())
         state = AgentState(**result_state)
         token_usage = get_token_usage()
         update_workflow_context(trajectoryId=state.trajectory_id)
@@ -214,21 +214,28 @@ async def resume_endpoint(req: ResumeRequest):
         workflow_event("input.sanitized", originalLength=len(req.response), cleanLength=len(clean_feedback))
         workflow_event("conversation.user_turn_saved", role="user", isFeedback=True)
 
-        state.user_feedback = clean_feedback
-        state.hitl_needed = False
-        if req.x:
-            state.user_x = req.x
-        if req.y:
-            state.user_y = req.y
-
-        updated = await update_memory_node(state)
-        state_dict = state.model_dump()
-        for k, v in updated.items():
-            state_dict[k] = v
-
         reset_token_usage()
-        workflow_event("graph.started", entryNode="update_memory")
-        result_state = await compiled_graph.ainvoke(state_dict)
+        cfg = {"configurable": {"thread_id": thread_id}}
+        snapshot = await compiled_graph.aget_state(cfg)
+        if snapshot is not None and snapshot.next:
+            # 主路径：checkpointer 里该线程仍挂着 interrupt → 真正的图内恢复。
+            # evaluate 确定性重放，interrupt() 返回用户反馈，feedback 路由 → update_memory → plan（全在图内）
+            workflow_event("graph.started", entryNode="evaluate(interrupt-resume)")
+            result_state = await compiled_graph.ainvoke(Command(resume=clean_feedback), config=cfg)
+        else:
+            # 兜底：进程重启丢 InMemorySaver checkpoint，或 plan 层 HITL（图已跑完）→
+            # 用 Redis 快照 + Command(goto) 从 update_memory 进图（update_memory → plan 边同样被走到）
+            state.user_feedback = clean_feedback
+            state.hitl_needed = False
+            if req.x:
+                state.user_x = req.x
+            if req.y:
+                state.user_y = req.y
+            workflow_event("graph.started", entryNode="update_memory(goto-fallback)")
+            result_state = await compiled_graph.ainvoke(
+                Command(goto="update_memory", update=state.model_dump()), config=cfg
+            )
+        result_state = {k: v for k, v in result_state.items() if k != "__interrupt__"}
         state = AgentState(**result_state)
         token_usage = get_token_usage()
         update_workflow_context(trajectoryId=state.trajectory_id)
