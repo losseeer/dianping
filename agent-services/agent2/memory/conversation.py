@@ -26,6 +26,11 @@ from core.mysql_store import (
 from graph.utils import normalize_score
 
 logger = logging.getLogger(__name__)
+# 【八股：in-flight 去重——同 thread 并发压缩防护】
+# 同一会话连续两轮对话会连调两次 append_turn，若不判重会同时起两个压缩任务：
+# 浪费一次 LLM 调用，且两个任务写 Redis/MySQL 的顺序不确定（旧结果可能覆盖新结果）
+# 这个 set 记录「正在压缩中」的 thread_id，任务结束（finally）才移除。
+# 注：单进程方案，多 worker 部署时应改用 Redis SETNX 分布式判重
 _compressing_threads: set[str] = set()
 
 SUMMARIZE_PROMPT = """你是对话上下文压缩器。请将以下多轮对话压缩为简洁的 bullet points 摘要。
@@ -111,6 +116,12 @@ async def append_turn(thread_id: str, user_id: int, role: str, content: str) -> 
     r.setex(_dirty_key(thread_id), 24 * 3600, "1")
 
     # 3. 立刻 fire-and-forget 触发后台压缩（方案 A）
+    # 【八股：fire-and-forget 的风险与兜底——为什么还要 dirty 标记？】
+    # create_task 把协程排入事件循环就返回，主请求不等压缩完成（省 1~2s LLM 延迟）
+    # 但后台任务可能失败甚至根本没跑（进程重启）——「发了就算完成」是不可靠投递
+    # dirty 标记 = 持久化的「待办」：写 MySQL 原文后立刻置位，压缩成功才清除
+    # 读路径发现 dirty 残留 → 说明后台没跑成 → piggyback 顺手补一次（最终一致性）
+    # 同一模式也用在 improve/signals.py（piggyback + daemon 双触发）
     try:
         all_turns = await load_conversation_turns(thread_id)
     except Exception as e:
@@ -120,6 +131,10 @@ async def append_turn(thread_id: str, user_id: int, role: str, content: str) -> 
     async def _bg_compress():
         """后台压缩任务：吞掉所有异常，不能让它崩主事件循环"""
         # 重置 token 计数：后台任务不应计入主请求的 tokenUsage 统计（asyncio Task 继承 context，set 会本地化生效）
+        # 【八股：asyncio.Task 的上下文拷贝语义】
+        # create_task 时框架 copy_context() 拷贝当前上下文给新任务，
+        # 任务内 contextvar.set() 只写进自己的副本，主请求上下文不受影响——
+        # 所以这里 reset_token_usage() 不会把主请求的统计清零
         try:
             reset_token_usage()
         except Exception:  # noqa: BLE001
@@ -188,6 +203,11 @@ async def get_context_summary(thread_id: str) -> str:
         return "(新会话，无历史上下文)"
 
     # dirty 且缓存 miss → piggyback kick 一次后台压缩（方案 B 兜底），不等待
+    # 【八股：piggyback（搭便车）模式——用读请求补写路径的洞】
+    # 后台压缩任务失败/进程重启后，dirty 标记会一直挂着。
+    # 与其起定时任务轮询，不如让下一次读请求「顺路」发现并补做：
+    # - 有流量 → 自然自愈，且天然按需（没流量就不浪费 LLM 调用）
+    # - 读请求本身不等待补做完成，仍然降级返回最近3轮原文（正确性不丢，只是 token 多一点）
     if dirty and not cached_str and thread_id not in _compressing_threads:
         async def _bg_compress_piggyback():
             try:

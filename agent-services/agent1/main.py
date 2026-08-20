@@ -37,6 +37,9 @@ app.add_middleware(
 
 async def collect_data(shop_id: int) -> dict:
     """采集商铺详情 + 全量评价"""
+    # 【八股:为什么走 Java REST API 而不直连数据库?】
+    # 数据口径、权限校验、缓存策略都收口在后端服务,Agent 只消费稳定契约
+    # 直连 DB 会把存储 schema 的变更扩散到所有调用方,服务边界一旦破坏很难收回
     shop = await java_api.get_shop_detail(shop_id)
 
     # 分页获取所有评价
@@ -78,6 +81,10 @@ async def analyze_reviews(reviews: list[dict], llm) -> list[dict]:
     batch_size = 5
 
     # 评价太多时按 liked 排序取代表性样本
+    # 【八股:为什么要采样而不是全量喂给 LLM?】
+    # token 成本随输入条数线性增长,200+ 条全量分析又贵又慢
+    # 按 liked 降序取前 150(高赞代表主流声音)+ 后 30(低赞保住少数差评视角)
+    # 少量样本兼顾分布代表性与成本,是典型的成本-质量权衡
     if len(reviews) > 200:
         sorted_reviews = sorted(reviews, key=lambda r: r.get("liked", 0), reverse=True)
         reviews_to_analyze = sorted_reviews[:150] + sorted_reviews[-30:]

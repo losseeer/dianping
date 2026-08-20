@@ -17,6 +17,10 @@ public class MvcConfig implements WebMvcConfigurer {
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
         //登录拦截器
+        // 【已知缺陷，面试可主动讲】白名单按前缀放行过宽：
+        // /voucher/**、/shop/**、/upload/** 把 POST/PUT 写操作也放行了
+        // （发券、改店铺、上传/删除文件无需登录即可调用），生产应只放行 GET 查询类路径，
+        // 写操作必须登录 + 角色校验（管理员），上传接口还要加后缀白名单和路径穿越校验
         registry.addInterceptor(new LoginInterceptor())
                 .excludePathPatterns(
                         "/user/login",

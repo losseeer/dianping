@@ -3,6 +3,16 @@
 
 设计原则：v1 全部零 LLM 调用（纯规则 + 结果反推），可解释，无并发压力。
 
+【八股：为什么蒸馏用规则反推而不是让 LLM 总结？】
+1. 成本与并发：蒸馏在后台批量跑（daemon 一次 16 条），LLM 方案每条轨迹多一次调用
+   且要挤占 call_llm 的令牌桶/信号量配额，与在线请求抢资源
+2. 可解释/可审计：max_distance=4.2@5shops 这样的 evidence 字符串就是学习依据，
+   出错能定位；LLM 蒸馏的结论无法追溯
+3. 无幻觉：「用户接受的最远店 4.2km → 学到附近≈4km」是从数据必然推出的，
+   LLM 可能编造不存在的模式
+4. 代价是覆盖面窄：只能学到预定义的模糊词模式（附近/便宜/高档），
+   泛化能力换确定性——工程上 v1 先规则跑通，v2 再考虑 LLM 扩展
+
 A) Playbook 蒸馏：用户模糊表达 → Agent 实际规范化参数 的映射（意图解析经验）
    - 例：用户说"附近"，最终推荐都在 ~5km 内 → 学到 trigger:"附近" → normalized:"约5km范围内"
    - 条目以 description="[fuzzy_mapping] ..." 编码，零 schema 变更
@@ -60,6 +70,11 @@ def playbook_distill(record: TrajectoryRecord) -> list[dict]:
     n = len(sample)
 
     # ---- A1. 附近 → 实际距离 ----
+    # 【八股：置信度与样本量挂钩——弱证据不出强结论】
+    # n>=3 家店佐证给 0.7，只有 1~2 家给 0.5：样本越小，反推结论越可能是巧合
+    # （只推荐了 1 家 3.9km 的店 ≠ 用户心中的"附近"就是 4km）
+    # 后续相同 trigger 再蒸馏出相似条目时 confidence 会随 timesApplied 累积，
+    # 相当于多次观测的贝叶斯式增强
     if any(k in msg for k in FUZZY_NEAR):
         dists = [float(s.get("distance") or 0) for s in sample if s.get("distance") is not None]
         if dists:
@@ -153,6 +168,11 @@ def preference_distill(record: TrajectoryRecord) -> dict:
             prefs["likedCategories"].append(f"type_{top_type}")
 
     # ---- B2. priceRange.max：仅当用户消息出现价格类模糊词时学习（避免"随便"学出很窄的价格偏好）
+    # 【八股：防过拟合——相关性不等于因果】
+    # 若无条件学习，用户说「随便推荐」而结果恰好都 ≤80 元，也会学出 max=80 的窄偏好，
+    # 之后推荐全被这个伪偏好过滤掉。只有用户明确表达过价格意图（便宜/预算/人均），
+    # 结果价格才可信为「用户接受的上限」。样本选择性偏差是所有从结果反推偏好
+    # 系统的头号陷阱（推荐系统里的反馈循环/信息茧房同源问题）
     has_price_hint = any(k in msg for k in (*FUZZY_CHEAP, *FUZZY_EXPENSIVE, "人均", "预算", "价位", "价格"))
     if has_price_hint:
         prices = [int(s.get("avgPrice") or 0) for s in sample if s.get("avgPrice")]

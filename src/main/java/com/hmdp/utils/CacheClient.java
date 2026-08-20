@@ -176,11 +176,11 @@ public class CacheClient {
         //1.尝试从Redis查询商铺缓存
         String json = stringRedisTemplate.opsForValue().get(key);
         //2.判断缓存是否存在
-        if(StrUtil.isBlank(json)) { //判断字符串既不为null，也不是空字符串(""),且也不是空白字符
-            //3.不存在，返回商铺信息
+        if(StrUtil.isBlank(json)) { //isBlank：为null、空串("")或纯空白字符时为true（与isNotBlank相反）
+            //3.缓存不存在，直接返回null
             // 【八股：逻辑过期方案的前提】
-            // 逻辑过期方案假设热点key已经预热到缓存中了
-            // 如果缓存里根本没有，说明不是热点数据，直接返回null
+            // 逻辑过期方案假设热点key已经预热到缓存中了（key无物理TTL，理论上常驻）
+            // 如果缓存里根本没有，说明不是热点数据，走queryWithPassThrough兜底
             // （真实项目中应该配合缓存预热机制，把热点数据提前加载）
             return null;
 
@@ -217,6 +217,11 @@ public class CacheClient {
                     throw new RuntimeException(e);
                 }finally {
                     //释放锁
+                    // 【已知缺陷，面试可主动讲】这里传的是数据key而非lockKey：
+                    // 1) 锁key从未被删除，只能等10s过期自动释放（靠TTL兜底，期间其他线程抢不到锁）
+                    // 2) unLock误删了缓存数据key本身，等于把逻辑过期的缓存直接清空，
+                    //    下次请求会走到"isBlank返回null"，防击穿失效
+                    // 正确写法：unLock(lockKey)
                     unLock(key);
                 }
             });

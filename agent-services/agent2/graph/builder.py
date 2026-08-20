@@ -1,6 +1,15 @@
 """
 LangGraph 状态图构建。
 
+【八股：为什么用状态机图而不是 while 循环 + if/else？】
+1. 显式状态转移：节点+边把「执行到哪、下一步去哪」变成一等公民，可画出拓扑图审查
+2. 防死循环：图里的环（plan↔evaluate）必须带守卫计数器（iteration/replan/hitl_count），
+   while 循环靠人肉纪律，图框架靠路由函数约束
+3. HITL 硬依赖 checkpoint：interrupt() 暂停时框架把整个 state 快照持久化到 checkpointer，
+   进程都不用活着；Command(resume) 从快照点恢复继续跑。while 循环无法「暂停在某个 await
+   并保存现场」——这是选 LangGraph 的决定性理由
+4. 可观测：每个节点天然是打点/计时边界（timed_node 装饰器）
+
 【重构 2026-08】新图拓扑：
   load_memory → plan → execute → evaluate → (feedback / generate / relax / replan)
     evaluate 命中 HITL 时图内 interrupt() 暂停（checkpointer 持久化线程状态），
@@ -60,6 +69,10 @@ def build_graph() -> StateGraph:
     graph.add_edge("update_memory", "plan")  # feedback 路由进入：HITL 用户反馈提取偏好后重新 plan
 
     # evaluate → 四路分叉
+    # 【八股：条件路由为什么必须是纯函数？】
+    # should_hitl 只读 state 返回下一节点名，无副作用、无 IO、无随机
+    # 纯函数路由保证：同一 state 永远路由到同一节点 → HITL resume 重放时
+    # 图能确定性地走到同一个位置，这是中断恢复正确性的前提
     graph.add_conditional_edges(
         "evaluate",
         should_hitl,

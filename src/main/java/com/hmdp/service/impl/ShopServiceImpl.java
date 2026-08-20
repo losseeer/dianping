@@ -72,143 +72,18 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     }
 
     private static final ExecutorService CACHE_REBUILD_EXECUTOR= Executors.newFixedThreadPool(10);
-      /*   public Shop queryWithLogicalExpire(Long id)   {
-//        //1.尝试从Redis查询商铺缓存
-//        String shopJson = stringRedisTemplate.opsForValue().get(RedisConstants.CACHE_SHOP_KEY + id);
-//        //2.判断缓存是否存在
-//        if(StrUtil.isBlank(shopJson)) { //判断字符串既不为null，也不是空字符串(""),且也不是空白字符
-//            //3.不存在，返回商铺信息
-//            return null;
-//
-//        }
-//
-//        //4.存在，将json反序列化为对象
-//        RedisData redisData = JSONUtil.toBean(shopJson, RedisData.class);
-//        Shop shop = JSONUtil.toBean((JSONObject) redisData.getData(), Shop.class);
-//        LocalDateTime expireTime = redisData.getExpireTime();
-//        //5.判断是否过期
-//        if(expireTime.isAfter(LocalDateTime.now())) {
-//            //5.1.未过期，直接返回店铺信息
-//            return shop;
-//        }
-//        //5.2.已过期，需要返回缓存重建
-//        //6.缓存重建
-//        //6.1.获取互斥锁
-//        String lockKey=RedisConstants.LOCK_SHOP_KEY+id;
-//        boolean isLock = tryLock(lockKey);
-//        //6.2.判断是否获取锁成功
-//        if(isLock){
-//            //  6.3.成功，开启独立线程实现缓存重建
-//            CACHE_REBUILD_EXECUTOR.submit(()->{
-//                try {
-//                    //重建缓存
-//                    this.saveShop2Redis(id,20L);
-//                } catch (Exception e) {
-//                    throw new RuntimeException(e);
-//                }finally {
-//                    //释放锁
-//                    unLock(lockKey);
-//                }
-//            });
-//
-//        }
-//
-//        //6.4.返回过期的商铺信息
-//        return shop;
-//
-//    }
-    /**
-     * 互斥锁解决缓存穿透
-     * @param id
-     * @return
-     * @throws InterruptedException
-     */
-    /* public Shop queryWithMutex(Long id) throws InterruptedException {
-        //1.尝试从Redis查询商铺缓存
-        String shopJson = stringRedisTemplate.opsForValue().get(RedisConstants.CACHE_SHOP_KEY + id);
-        //2.判断缓存是否存在
-        if(StrUtil.isNotBlank(shopJson)) { //判断字符串既不为null，也不是空字符串(""),且也不是空白字符
-            //3.存在，返回商铺信息
-            return JSONUtil.toBean(shopJson, Shop.class);
-
-        }
-        //判断是否为空值
-        if(shopJson!=null){
-            return null;
-        }
-        //4.实现缓存重建
-        //4.1获取互斥锁
-        String lockKey="lock:shop:"+id;
-        Shop shop=null;
-        try {
-            boolean isLock = tryLock(lockKey);
-            //4.2判断是否获取成功
-            if(!isLock) {
-                //4.3失败，则休眠重试
-               Thread.sleep(50);
-                return queryWithMutex(id);
-            }
-
-            //4.4.成功，根据id查询数据库
-            shop = getById(id);
-            //模拟重建的延迟
-            Thread.sleep(200);
-            //5.判断数据库中是否存在
-            if(shop==null){
-                //6.不存在，返回错误状态码
-                stringRedisTemplate.opsForValue().set(RedisConstants.CACHE_SHOP_KEY+id,"",RedisConstants.CACHE_NULL_TTL,TimeUnit.MINUTES);
-                return null;
-            }
-            //7.存在，写入redis，返回商铺信息
-            String newShopJson = JSONUtil.toJsonStr(shop);
-            stringRedisTemplate.opsForValue().set(RedisConstants.CACHE_SHOP_KEY+id,newShopJson,RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        }finally {
-            unLock(lockKey);
-        }
-
-        //9.返回
-        return shop;
-
-    }*/
-    /**
-     * 缓存穿透
-     * @param id
-     * @return
-     */
-    /*
-//        //1.尝试从Redis查询商铺缓存
-//        String shopJson = stringRedisTemplate.opsForValue().get(RedisConstants.CACHE_SHOP_KEY + id);
-//        //2.判断缓存是否存在
-//        if(StrUtil.isNotBlank(shopJson)) { //判断字符串既不为null，也不是空字符串(""),且也不是空白字符
-//            //3.存在，返回商铺信息
-//            return JSONUtil.toBean(shopJson, Shop.class);
-//
-//        }
-//        //判断是否为空值
-//        if(shopJson!=null){
-//            return null;
-//        }
-//        //4.不存在，根据id查询数据库
-//        Shop shop = getById(id);
-//        //5.判断数据库中是否存在
-//        if(shop==null){
-//            //6.不存在，返回错误状态码
-//            stringRedisTemplate.opsForValue().set(RedisConstants.CACHE_SHOP_KEY+id,"",RedisConstants.CACHE_NULL_TTL,TimeUnit.MINUTES);
-//            return null;
-//        }
-//        //7.存在，写入redis，返回商铺信息
-//        String newShopJson = JSONUtil.toJsonStr(shop);
-//        stringRedisTemplate.opsForValue().set(RedisConstants.CACHE_SHOP_KEY+id,newShopJson,RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
-//
-//        return shop;
-//
-//    }
-
-     */
+    // 【八股：防击穿两方案对比——互斥锁 vs 逻辑过期】
+    // 旧版把三套查询实现内嵌在本类里（已删，git 历史可查），现统一收敛到 CacheClient 工具类：
+    // - 互斥锁版：缓存失效时 setnx 抢锁，仅一个线程查库重建，其他线程休眠重试
+    //   一致性强；缺点是重建期间请求阻塞、递归重试有栈溢出风险（需改成循环）
+    // - 逻辑过期版（当前启用）：value 内嵌过期时间字段，key 无物理 TTL 永不失效；
+    //   发现逻辑过期 → 抢到锁的线程异步重建，所有请求立即返回旧数据——用一致性换可用性
+    // 选型：商品详情等热点数据允许秒级不一致，用逻辑过期；交易强一致数据用互斥锁或直查DB
+    // 注意：上方 CACHE_REBUILD_EXECUTOR 字段是旧实现遗留、当前无人引用，属待清理代码
 
 
+    // 【八股：缓存预热】逻辑过期方案的前提：热点key必须在流量到来前主动写入Redis，
+    // 否则第一次访问必然miss，防击穿无从谈起（配合 queryById 的穿透兜底形成双保险）
     public void saveShop2Redis(Long id,Long expireSeconds) throws InterruptedException {
         //1.查询店铺数据
         Shop shop = getById(id);
@@ -228,6 +103,12 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if(id==null){
             return Result.fail("店铺id不能为空");
         }
+        // 【八股：Cache Aside 写路径——先更新DB，再删除缓存】
+        // 为什么删缓存而不是更新缓存：并发写下两边计算结果可能乱序互相覆盖；
+        // 删除=懒加载，下次读miss时自然回填最新值
+        // 为什么先库后缓存：反过来(先删缓存后更库)的窗口里，读请求会把旧值回填进缓存，
+        // 脏数据要活到下一次删除；先库后缓存最坏只是短暂旧数据，删除失败还能补偿重删
+        // 加强方案：延迟双删（更新后延迟几百ms再删一次，覆盖回填窗口），本项目短TTL下可省略
         //1.先修改数据库
         updateById(shop);
         //2.删除缓存
@@ -250,6 +131,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         int end=current*SystemConstants.DEFAULT_PAGE_SIZE;
 
         //3.查询redis，按照距离排序，分页。结果：shopId,distance
+        // 【八股：GEO 附近的店】底层是 GeoHash：经纬度交错编码成一维字符串，
+        // 前缀相同=地理相邻，把"圆形范围检索"转化为有序集合上的前缀范围查询
+        // 按 typeId 分 key（shop:geo:{typeId}）避免单一大key；member存shopId，距离由Redis计算
         String key = SHOP_GEO_KEY + typeId;
         //在 Redis 中按地理坐标（x, y）查询距离当前用户位置 5000 米内的商店
         GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo()
@@ -279,6 +163,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             distanceMap.put(shopIdStr,distance);
         });
         //5.根据id查询shop
+        // 【八股：order by field(id,...) 保序】in 查询返回是主键序而非距离序，
+        // 用 field() 按传入顺序重排；注意这是拼接SQL，id必须只来自服务端（防SQL注入）
+        // 已知局限：GEO limit(end) 取回前N页再内存skip，深分页会多取数据，改进方向是游标式分页
         String idStr = StrUtil.join(",", ids);
         List<Shop> shops = query()
                 .in("id", ids).last("order by field(id," + idStr + ")").list();

@@ -50,6 +50,10 @@ public class SimpleRedisLock implements ILock{
      */
     private static final DefaultRedisScript<Long> UNLOCK_SCRIPT;
     static {
+        // 【八股：真实的跨平台坑】这里加载的是 "unlock.lua"（小写l），
+        // 但资源文件实际叫 "unLock.lua"（大写L）——Windows文件系统大小写不敏感能正常跑，
+        // 一旦部署到Linux（大小写敏感）会抛ClassPathResource找不到的异常
+        // 教训：资源文件命名全小写，加载路径与文件名严格一致，容器化部署前在Linux环境验证
         UNLOCK_SCRIPT=new DefaultRedisScript<>();
         UNLOCK_SCRIPT.setLocation(new ClassPathResource("unlock.lua"));
         UNLOCK_SCRIPT.setResultType(Long.class);
@@ -88,15 +92,10 @@ public class SimpleRedisLock implements ILock{
         );
     }
 
-//    @Override
-//    public void delLock() {
-//        //获取线程标识
-//        String threadId = ID_PREFIX + Thread.currentThread().getId();
-//        //获取锁中标识
-//        String id = stringRedisTemplate.opsForValue().get(KEY_PREFIX + name);
-//        if (threadId.equals(id)) {
-//            //释放锁
-//            stringRedisTemplate.delete(KEY_PREFIX + name);
-//        }
-//    }
+    // 【八股：这个简易锁还有什么局限？→ 为什么生产要用Redisson】
+    // 1. 不可重入：同一线程二次tryLock会失败（Redisson用Hash结构存重入计数解决）
+    // 2. 不可重试：失败直接返回，不能阻塞等待（Redisson的tryLock带waitTime自旋订阅解锁消息）
+    // 3. 无续期：业务超时锁被误释放（Redisson看门狗每10s续期到30s）
+    // 4. 主从切换丢锁：master写入锁后未同步到slave就宕机，新master上锁消失（RedissonmultiLock/红锁方案，存在争议）
+    // 旧版"判断+删除"分离的非原子释放实现已删除，演进过程见类头注释
 }

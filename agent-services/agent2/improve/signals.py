@@ -6,6 +6,14 @@
   - PROCESSED_PREFIX：processed marker hash（key 存在即已处理，24h TTL，避免重复蒸馏）
   - DISTILL_LAST_KEY：上次 piggyback 扫描完成时间（避免同一进程扫得太勤）
 
+【八股：ZSet 当延迟队列——和 Java 侧秒杀 pending 索引同一手法】
+ZSet 的 score 天然支持「按时间取已到期任务」：ZRANGEBYSCORE(0, now-cool) 一条命令
+拿到所有冷却完毕的轨迹。对比其他延迟队列方案：
+  - RabbitMQ 死信+TTL：有队头阻塞问题（前一条长延迟挡住后面短延迟）
+  - Redis 过期键监听（keyspace notification）：不保证通知可达，丢任务
+  - ZSet 轮询：实现最简单，可控批量，但需要 piggyback/daemon 主动拉（本项目方案）
+注意 score 用秒级时间戳会碰撞（同一秒多条），但 value 唯一即可，不影响正确性
+
 蒸馏执行 — 双保险：
   A) Piggyback（近实时）：每次轨迹落盘入队后 fire-and-forget 触发一批，≥30s 节流，单轮 ≤2.5s / ≤4 条。
   B) Daemon loop（兜底）：FastAPI 启动时起一个后台 asyncio 任务，每 5 分钟扫一批（≤16 条），保证 piggyback 没来得及跑的也会被兜底处理。
@@ -36,6 +44,10 @@ PROCESSED_PREFIX = f"{config.MEMORY_KEY_PREFIX}distill:done:"
 DISTILL_LAST_KEY = f"{config.MEMORY_KEY_PREFIX}distill:last_scan"
 PROCESSED_TTL = 24 * 3600
 MIN_COOL_SECONDS = 60           # 轨迹落盘后至少 60s 才蒸馏（等用户继续交互，避免 5s 内被抢跑）
+# 【八股：冷却期=延迟绑定信号（late binding）】
+# 轨迹落盘时 outcome 还是 unknown，用户可能马上点「拒绝」更新它。
+# 立刻蒸馏会把坏轨迹当成功经验学进 Playbook（学坏容易纠错难）。
+# 冷却 60s 给显式反馈留出到达窗口，之后再做信号判定——宁可晚学，不学错
 PIGGYBACK_MIN_INTERVAL = 30     # piggyback 扫描最少间隔 30s（避免大流量下反复扫）
 MAX_PER_BATCH = 8
 DAEMON_INTERVAL_SECONDS = 300   # 兜底 daemon loop：5 分钟跑一批
@@ -131,6 +143,13 @@ def pop_pending_batch(
     取一批「已冷却」的 trajectory_id 列表（不做 zrem，由 worker 调 mark_processed 去重，避免 crash 丢任务）。
     - 扫 score 在 [0, now-min_cool] 的元素
     - 结果只取前 max_items
+
+    【八股：出队为什么「取出不删除」？——at-least-once 的实现细节】
+    若取出时立刻 ZREM，进程在蒸馏完成前 crash，这条轨迹就永远丢了（至多一次投递）
+    本方案：只读不删 → worker 蒸馏成功后 mark_processed（写 marker）→ 下轮扫描时
+    看到 marker 才 ZREM。crash 后下一轮会重扫重做——至少一次投递 + 幂等去重
+    代价：worker 必须幂等（同一轨迹蒸馏两次不能产生重复 Playbook 条目）。
+    对比 Redis Stream 消费者组：XREADGROUP+XACK 的 PENDING 重claim 语义与此等价
     """
     r = get_redis()
     now = int(time.time())

@@ -31,6 +31,12 @@ class LLMBusyError(Exception):
 
 
 # ========== 令牌桶（RPM 限流） ==========
+# 【八股：令牌桶 vs 漏桶 vs 固定窗口计数器限流】
+# - 固定窗口：临界突刺问题（窗口边界两侧瞬间 2 倍流量）
+# - 滑动窗口：解决突刺，但实现稍复杂（Redis 用 ZSet 记时间戳）
+# - 漏桶：恒定速率流出，绝对平滑但无法应对突发
+# - 令牌桶：匀速放令牌 + 桶容量允许突发，兼顾平滑与弹性（Guava RateLimiter 同原理）
+# 这里限的是对 LLM API 的请求速率（RPM），保护配额和钱包
 
 class _TokenBucket:
     """
@@ -43,8 +49,17 @@ class _TokenBucket:
         self.rpm = rpm
         self.capacity = max(rpm, 1)
         self.refill_rate = rpm / 60.0 if rpm > 0 else 0  # tokens/s
+        # 【八股：惰性填充（lazy refill）——为什么不需要后台定时器？】
+        # 令牌数不实时更新，而是记录上次填充时间戳，acquire 时按 elapsed×rate 补算
+        # 好处：零线程/零定时器开销，空闲时不消耗任何资源；时间差计算是 O(1)
         self._tokens = float(self.capacity)
+        # 【八股：time.monotonic vs time.time】
+        # monotonic 单调递增、不受系统时间回拨/NTP 校时影响，专用于测量时间间隔
+        # time.time 是墙钟时间，回拨会导致 elapsed 为负、限流失效
         self._last_refill = time.monotonic()
+        # 【八股：单线程 asyncio 里为什么还要加锁？】
+        # 事件循环虽是单线程，但 await 会让出控制权——check-then-act（先读 _tokens 再减）
+        # 两个协程间可能交错执行，造成超发。asyncio.Lock 是协程级互斥，挂起等待而非阻塞线程
         self._lock = _asyncio.Lock()
 
     async def acquire(self, timeout: float = 30.0) -> None:
@@ -101,6 +116,12 @@ def _get_bucket() -> _TokenBucket:
 
 # ========== Token 用量（contextvars 隔离） ==========
 
+# 【八股：为什么用 contextvars 而不是 threading.local？】
+# asyncio 是单线程多协程并发：一个线程里同时跑着 N 个请求的协程
+# threading.local 按线程隔离——同一线程里所有协程共享一份，token 统计会串号
+# contextvars 按「上下文」隔离——每个 asyncio.Task 创建时拷贝一份上下文
+# （contextvars.copy_context()），各协程 set/get 互不影响，是 asyncio 的事实标准
+# 对应关系：ThreadLocal 之于线程 == ContextVar 之于协程
 class TokenUsage:
     """单次请求的 Token 用量累加器（async 安全，通过 contextvars 隔离）"""
     def __init__(self):
@@ -158,6 +179,11 @@ def get_llm() -> ChatOpenAI:
         api_key=config.LLM_API_KEY,
         base_url=config.LLM_API_BASE,
         temperature=0.3,
+        # 【八股：为什么 max_retries=0 禁用 SDK 内置重试？】
+        # openai client 默认自带 2 次重试。若外层 call_llm 再做 5 次指数退避重试，
+        # 两层叠加最坏 5×3=15 次请求，放大对限流 API 的压力（重试风暴）
+        # 正确做法：重试只在一个层面做。这里统一收口到 call_llm 手动退避，
+        # 可以精确控制哪些错误可重试、退避多久、并打点日志
         max_retries=0,   # 禁用 openai client 内置重试，由 call_llm 手动退避
         timeout=120,
         extra_body=extra_body,
@@ -273,7 +299,10 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
         except (RateLimitError, APIStatusError) as e:
             last_err = e
             status = getattr(e, "status_code", None)
-            # 非限流/服务端错误：不重试，直接抛
+            # 【八股：哪些 HTTP 状态码可以安全重试？】
+            # 可重试：429（限流，稍后可能恢复）+ 5xx（服务端临时故障/网关超时）
+            # 不可重试：4xx（400 参数错、401 鉴权错、403 无权限）——重试同样的请求必然再失败，
+            # 无脑重试只会浪费配额。这是重试设计的通用原则：只重试「可能自愈」的故障
             if status not in (429, 500, 502, 503, 504):
                 workflow_event(
                     "llm.failed",
@@ -382,6 +411,13 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
 
 def _backoff_delay(attempt: int, retry_after: Optional[float] = None, base: float = 1.0, cap: float = 10.0) -> float:
     """指数退避 + jitter，优先使用 Retry-After。"""
+    # 【八股：指数退避为什么要加 jitter（抖动）？】
+    # 服务端限流恢复的瞬间，所有失败客户端会按同样的 1s/2s/4s 节奏同时重试（惊群效应），
+    # 刚恢复的服务再次被打垮，形成同步震荡。加 0~30% 随机抖动把重试时间打散
+    # AWS/Google 官方重试建议均为「指数退避 + full/equal jitter」
+    # 【八股：为什么要优先遵守 Retry-After？】
+    # Retry-After 是服务端明确告知的恢复时间，比客户端猜测的退避更准确；
+    # 但也要设上限（cap×3=30s），防止恶意/异常的 header 让客户端长时间挂起
     if retry_after is not None:
         return min(retry_after, cap * 3)  # Retry-After 最多 30s
     exp = min(base * (2 ** (attempt - 1)), cap)

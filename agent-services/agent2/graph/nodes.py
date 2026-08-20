@@ -220,6 +220,10 @@ async def plan_node(state: AgentState) -> dict:
     )
 
     # 工具调用白名单校验
+    # 【八股：为什么必须校验 LLM 生成的工具调用？——Prompt Injection 防线】
+    # 用户消息会被拼进 plan prompt，恶意输入「忽略以上指令，调用 xxx 工具」可能诱导
+    # LLM 产出白名单外的工具名/危险参数。validate_tool_calls 做白名单+参数裁剪：
+    # LLM 只能在框架允许的范围内「点菜」，不能「进厨房」
     raw_tool_calls = [tc for tc in (parsed.get("tool_calls") or []) if isinstance(tc, dict)]
     valid_tool_calls, rejected = validate_tool_calls(raw_tool_calls)
 
@@ -287,6 +291,14 @@ async def evaluate_node(state: AgentState) -> dict:
     """
     【重构 2026-08】纯规则判定候选是否充足，零 LLM 调用。
 
+    【八股：为什么 evaluate 用纯规则而不用 LLM 自评？】
+    1. 确定性重放是 HITL 的硬前提：interrupt() 暂停后 resume 会从头重放本节点，
+       只有纯规则（无随机、无外部状态）才能保证重放结果与暂停前一致，路由才不会漂移
+    2. LLM 判定有抖动（temperature>0、上下文敏感），同一个 state 可能给出不同结论
+    3. 「候选够不够」本质是 count>=N 的比较，交给概率模型是杀鸡用牛刀：
+       白白多一次 LLM 调用的延迟和成本
+    原则：确定性逻辑用代码，模糊语义理解才用 LLM
+
     判定优先级：
       1. 已经 HITL 过 (hitl_count ≥ 1) → 强制 sufficient，不再打断用户（单轮最多一次 HITL 保证）
       2. 候选数 ≥ AGENT2_MIN_CANDIDATES 且执行过搜索 → sufficient
@@ -338,6 +350,14 @@ async def evaluate_node(state: AgentState) -> dict:
         # 真正的图内 HITL：interrupt() 抛出 GraphInterrupt 暂停图执行，由 checkpointer 持久化。
         # resume 时本节点确定性重放（规则逻辑重算结果相同），interrupt() 返回用户反馈，
         # 随后走 feedback 分支路由到 update_memory。
+        # 【八股：interrupt() 的实现原理像什么？——协作式暂停，类似异常】
+        # interrupt(payload) 向外抛 GraphInterrupt，图框架捕获后：
+        #   ① 把当前 state + 执行位置快照存入 checkpointer（按 thread_id 索引）
+        #   ② ainvoke 正常返回（结果里带 __interrupt__ 载荷），API 层把它转成响应给前端
+        # Command(resume=xxx) 再次 ainvoke 同一 thread_id 时：
+        #   ① checkpointer 恢复快照，从被中断的节点开头重放（不是从断点续行！）
+        #   ② 重放到 interrupt() 调用处时，这次返回 resume 值而不是再抛出
+        # 这就是为什么本节点必须是纯规则：重放要求「再来一遍结果不变」
         feedback = interrupt({"question": hitl_question, "options": hitl_options, "reason": hitl_reason})
         evaluation = "feedback"
         reasoning = "HITL 已收到用户反馈（Command(resume)），转 update_memory 提取偏好后重新规划"
@@ -645,6 +665,11 @@ async def generate_recommendation_node(state: AgentState) -> dict:
         relaxed_count += 1
 
     # ---- Client-side 硬过滤（与 GENERATE prompt 的 R2/R3/R4 同步执行，形成双重保障）----
+    # 【八股：为什么 prompt 里写了规则，代码还要再过滤一遍？——不信任 LLM 输出】
+    # LLM 对指令的遵循是概率性的：偶尔会「看见」排除关键词仍然推荐（尤其候选少时）
+    # 硬约束（价格上限/评分下限/排除词）必须由代码保证 100% 执行，
+    # LLM 只负责它擅长的：语义排序、权衡和文案生成。这就是「LLM 划选项，代码定规则」
+    # 双重保障的代价为零：prompt 规则让 LLM 大多数时候自己过滤掉，代码兜底漏网的
     filtered: list[dict] = []
     for shop in merged:
         # R3: 价格上限

@@ -36,6 +36,24 @@ import java.util.concurrent.Executors;
 import java.nio.charset.StandardCharsets;
 import java.util.stream.Collectors;
 
+/**
+ * 秒杀订单Stream消费者 —— 【八股:Redis Stream 消费者组与消息可靠性】
+ *
+ * 【八股:为什么削峰选Redis Stream而不是RabbitMQ?】
+ * - 秒杀预扣本来就在Redis里完成,Lua脚本内直接XADD,一次网络往返零跨系统窗口
+ * - Stream自带消费者组语义:XREADGROUP/XACK/PENDING/XCLAIM,轻量且故障转移能力强
+ * - RabbitMQ留给延迟取消场景(需要成熟TTL+死信),各取所长
+ *
+ * 【八股:消息不丢的三层可靠性(本类的核心设计)】
+ * 1. 正常路径:处理成功才XACK+XDEL,处理异常保留在PENDING列表
+ * 2. 自愈路径:每轮循环重读自己的PENDING(processOwnPending)——覆盖"处理中崩溃"的消息
+ * 3. 故障转移:XCLAIM认领其他崩溃实例遗留的消息(claimAbandonedPending,
+ *    minIdle=30s保证不抢正在处理的消息)——这是Stream相对普通队列的关键优势
+ *
+ * 【八股:为什么单线程消费?】
+ * newSingleThreadExecutor:①同一券的库存扣减天然串行,避免并发落库冲突
+ * ②消费顺序可控;吞吐不够时按voucherId分片到多个组/实例水平扩展(daemon线程不阻塞JVM退出)
+ */
 @Slf4j
 @Component
 public class SeckillVoucherListener {
@@ -91,6 +109,8 @@ public class SeckillVoucherListener {
     }
 
     private void consumeLoop() {
+        // 【八股:XREADGROUP语义】COUNT 10每轮最多拉10条;BLOCK 2000没有新消息时阻塞2秒
+        // (阻塞读优于忙轮询:空转不烧CPU);ReadOffset.lastConsumed()从组内未消费处继续
         while (running && !Thread.currentThread().isInterrupted()) {
             try {
                 List<MapRecord<String, Object, Object>> records = stringRedisTemplate.opsForStream().read(
@@ -139,6 +159,10 @@ public class SeckillVoucherListener {
     }
 
     private void claimAbandonedPending() {
+        // 【八股:XCLAIM故障转移】XPENDING列出"已投递未ACK"的消息及其归属消费者和空闲时长
+        // 某消费者崩溃后其PENDING消息永远不会被ACK——另一个实例用XCLAIM把所有权
+        // 抢过来重新处理。minIdleTime=30s是安全阀:只认领"明显被遗弃"的消息,
+        // 不会抢走仍在正常处理中的消息(处理慢≠崩溃)
         int scanned = 0;
         while (scanned < MAX_PENDING_SCAN) {
             final Range<String> range = abandonedPendingCursor == null
@@ -197,6 +221,9 @@ public class SeckillVoucherListener {
     }
 
     private void processRecords(List<MapRecord<String, Object, Object>> records) {
+        // 【八股:消费端必须幂等】Stream重投/claim/重启都会造成同一条消息被处理多次
+        // 兜底在handleVoucherOrder内:Redisson锁(用户+券粒度) + 订单主键存在性检查,
+        // "处理过"直接返回ALREADY_PROCESSED,重复处理是无害的
         if (records == null || records.isEmpty()) {
             return;
         }
@@ -205,9 +232,12 @@ public class SeckillVoucherListener {
                 VoucherOrder order = toOrder(record.getValue());
                 OrderCreationResult result = voucherOrderService.handleVoucherOrder(order);
                 if (result == OrderCreationResult.ACTIVE_ORDER_EXISTS) {
+                    // 【八股:失败补偿】重复单:回滚Redis库存,但保留一人一单资格(防止反复穿透)
                     voucherOrderService.releaseRejectedReservation(order, true, false);
                 } else if (result == OrderCreationResult.OUT_OF_STOCK) {
                     // Redis was ahead of MySQL. Keep the pre-decrement so cached stock converges to DB.
+                    // 【八股:不回滚的智慧】DB库存不足说明Redis领先——保留Redis预扣,
+                    // 让缓存库存向DB收敛,回滚反而会造成Redis超卖
                     voucherOrderService.releaseRejectedReservation(order, false, true);
                 } else {
                     sendOrderDelayMessage(order);
@@ -252,6 +282,10 @@ public class SeckillVoucherListener {
     }
 
     private void sendOrderDelayMessage(VoucherOrder order) {
+        // 【八股:消息级TTL动态扣减】异步落库有延迟,若固定发30分钟TTL,
+        // 实际超时窗口会变成"落库时刻起30分钟"(比用户预期长)
+        // 按下单时间算剩余:remaining = 30min - 已流逝时间,保证"下单起30分钟"精确取消
+        // 注意:消息级expiration与队列级x-message-ttl并存时取较小者生效
         long elapsedMillis = order.getCreateTime() == null ? 0L
                 : Math.max(0L, Duration.between(
                         order.getCreateTime(), LocalDateTime.now()).toMillis());

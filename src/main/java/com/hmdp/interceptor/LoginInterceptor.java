@@ -58,12 +58,12 @@ public class LoginInterceptor implements HandlerInterceptor {
        // 2. 复用：第一层拦截器已经查过Redis了，没必要再查一次
        // 3. 解耦：业务代码不需要关心用户从哪来的，直接从UserHolder取就行
         if(UserHolder.getUser()==null){
-            //没有需要拦截，设置状态码
+            //没有用户，设置状态码401
             response.setStatus(401);
             //拦截
             return false;
         }
-        //由用户放行
+        //有用户，放行
         return true;
     }
 }
