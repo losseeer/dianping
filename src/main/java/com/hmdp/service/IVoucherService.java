@@ -22,4 +22,9 @@ public interface IVoucherService extends IService<Voucher> {
     Result queryAllSeckillVoucher();
 
     void addSeckillVoucher(Voucher voucher);
+
+    /**
+     * 新增普通券（只落 tb_voucher，不写秒杀表和 Redis 库存）
+     */
+    void addVoucher(Voucher voucher);
 }

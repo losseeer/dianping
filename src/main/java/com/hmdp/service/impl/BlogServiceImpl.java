@@ -1,7 +1,6 @@
 package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
-import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hmdp.dto.Result;
@@ -23,13 +22,11 @@ import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.stream.LongStream;
 
 import static com.hmdp.utils.RedisConstants.BLOG_LIKED_KEY;
 import static com.hmdp.utils.RedisConstants.FEED_KEY;
@@ -311,7 +308,7 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
      * - 本次最小时间戳的重复个数（作为下次的offset）
      */
     @Override
-    public Result quertBlogOfFollow(Long max, Integer offset) {
+    public Result queryBlogOfFollow(Long max, Integer offset) {
         //1.获取当前用户
         Long userId = UserHolder.getUser().getId();
         //2.查询收件箱  zrevrangebyscore key  min max limit offset count

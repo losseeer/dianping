@@ -7,10 +7,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
-import org.aspectj.lang.reflect.MethodSignature;
 import org.springframework.stereotype.Component;
 
-import java.lang.reflect.Method;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -89,40 +87,12 @@ public class RateLimitAspect {
         return joinPoint.proceed();
     }
 
-    /**
-     * 获取方法标识（类名.方法名）
-     */
     private String getMethodName(ProceedingJoinPoint joinPoint) {
-        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
-        Method method = signature.getMethod();
-        return method.getDeclaringClass().getSimpleName() + "." + method.getName();
+        return AspectFallbackSupport.getMethodName(joinPoint);
     }
 
-    /**
-     * 反射调用降级方法
-     *
-     * 【八股：降级方法的要求】
-     * 1. 必须和原方法在同一个类中
-     * 2. 方法签名（返回值、参数列表）必须一致
-     * 3. 访问修饰符不影响（private也能通过反射调用）
-     * 4. 降级方法上不要加@RateLimit（否则又被限流了）
-     */
     private Object invokeFallback(ProceedingJoinPoint joinPoint, String fallbackName) throws Throwable {
-        try {
-            MethodSignature signature = (MethodSignature) joinPoint.getSignature();
-            Method fallbackMethod = signature.getDeclaringType().getDeclaredMethod(
-                    fallbackName, signature.getParameterTypes());
-            fallbackMethod.setAccessible(true);
-
-            // 获取目标对象（Controller实例），反射调用降级方法
-            Object target = joinPoint.getTarget();
-            return fallbackMethod.invoke(target, joinPoint.getArgs());
-        } catch (NoSuchMethodException e) {
-            log.error("降级方法不存在: {}", fallbackName, e);
-            return Result.fail("系统繁忙，请稍后再试");
-        } catch (Exception e) {
-            log.error("降级方法执行异常: {}", fallbackName, e);
-            return Result.fail("系统繁忙，请稍后再试");
-        }
+        return AspectFallbackSupport.invokeFallback(
+                joinPoint, fallbackName, Result.fail("系统繁忙，请稍后再试"));
     }
 }

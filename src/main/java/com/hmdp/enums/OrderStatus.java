@@ -53,7 +53,7 @@ public enum OrderStatus {
     }
 
     /**
-     * 根据code获取枚举
+     * 根据code获取枚举（严格版：未知状态码直接抛异常，用于状态机校验路径）
      */
     public static OrderStatus of(int code) {
         for (OrderStatus status : values()) {
@@ -62,6 +62,19 @@ public enum OrderStatus {
             }
         }
         throw new IllegalArgumentException("非法订单状态码: " + code);
+    }
+
+    /**
+     * 根据code取描述文案（宽松版：未知状态码不抛异常，仅用于组装用户提示语，
+     * 避免脏数据让"错误提示"路径自己变成 500）
+     */
+    public static String descOf(int code) {
+        for (OrderStatus status : values()) {
+            if (status.code == code) {
+                return status.desc;
+            }
+        }
+        return "未知状态(" + code + ")";
     }
 
     /**

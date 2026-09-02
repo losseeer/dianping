@@ -782,10 +782,10 @@ class EvalRunner:
         # Mock get_review_summary（Agent1 未启动）
         import graph.nodes as gn
         _orig_exec = gn.execute_tool
-        async def _patched_exec(tool_name, params):
+        async def _patched_exec(tool_name, params, state=None):
             if tool_name == "get_review_summary":
                 return {"recommendation": "分析中", "topPros": [], "topCons": []}
-            return await _orig_exec(tool_name, params)
+            return await _orig_exec(tool_name, params, state)
         gn.execute_tool = _patched_exec
         jc.shop_api = shop_api_mysql
 
@@ -1198,6 +1198,13 @@ TRAJECTORY_JUDGE_PROMPT = """你是 Agent 推理轨迹评估器。请评估以�
 只输出 JSON: {{"intent_understanding": 4, "tool_selection": 4, "tool_order": 5, "reflection_utilization": 3, "termination_timing": 4}}"""
 
 
+def _extract_json_object(text: str) -> dict:
+    """从 LLM 响应文本中提取第一个 {...} JSON 对象；解析失败返回 {}（三个 LLM-Judge 共用）"""
+    import re
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    return json.loads(m.group()) if m else {}
+
+
 async def _judge_trajectory(user_message, node_logs, decisions, iteration_count):
     """LLM-as-Judge 评估推理轨迹合理性（Exp-2 轨迹评估）"""
     if not node_logs:
@@ -1220,9 +1227,7 @@ async def _judge_trajectory(user_message, node_logs, decisions, iteration_count)
             decisions=decisions_text[:1000],
             iteration_count=iteration_count,
         ))])
-        import re
-        m = re.search(r'\{.*\}', resp.content, re.DOTALL)
-        return json.loads(m.group()) if m else {}
+        return _extract_json_object(resp.content)
     except Exception:
         return {}
 
@@ -1276,9 +1281,7 @@ async def _llm_judge(query, shops):
             "score": s.get("score", "?"), "reason": s.get("matchReason", "")[:60],
         } for s in shops[:5]], ensure_ascii=False)
         resp = await call_llm([HumanMessage(content=JUDGE_PROMPT.format(query=query, shops=shops_text))])
-        import re
-        m = re.search(r'\{.*\}', resp.content, re.DOTALL)
-        return json.loads(m.group()) if m else {}
+        return _extract_json_object(resp.content)
     except Exception:
         return {}
 
@@ -1290,9 +1293,7 @@ async def _judge_playbook(entries):
     try:
         entries_text = "\n".join([f"- [{e.category}] {e.description[:80]}" for e in entries[:10]])
         resp = await call_llm([HumanMessage(content=PLAYBOOK_JUDGE_PROMPT.format(entries=entries_text))])
-        import re
-        m = re.search(r'\{.*\}', resp.content, re.DOTALL)
-        return json.loads(m.group()) if m else {}
+        return _extract_json_object(resp.content)
     except Exception:
         return {}
 
@@ -1515,10 +1516,10 @@ async def run_experiments(cases=None):
     # Mock get_review_summary (Agent1 未启动)
     import graph.nodes as gn
     _orig_exec = gn.execute_tool
-    async def _patched(tool_name, params):
+    async def _patched(tool_name, params, state=None):
         if tool_name == "get_review_summary":
             return {"recommendation": "分析中", "topPros": [], "topCons": []}
-        return await _orig_exec(tool_name, params)
+        return await _orig_exec(tool_name, params, state)
     gn.execute_tool = _patched
 
     jc.shop_api = shop_api_mysql

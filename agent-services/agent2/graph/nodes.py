@@ -36,71 +36,35 @@ async def execute_tool(tool_name: str, params: dict, state: AgentState = None) -
             x = params.get("x") or params.get("user_x")
             y = params.get("y") or params.get("user_y")
             shops = await shop_api.search_shops(keyword, x=x, y=y)
-            # 与 search_shops_nearby 一致的 client-side 后处理
-            max_price = params.get("maxPrice")
-            min_score = params.get("minScore")
-            if max_price:
-                shops = [s for s in shops if float(s.get("avgPrice", 999)) <= max_price]
-            if min_score:
-                shops = [s for s in shops if normalize_score(s.get("score")) >= min_score]
-            for s in shops:
-                s["score"] = normalize_score(s.get("score"))
-            shops = rank_shops(shops)
-            # 过滤已推荐商铺
-            if state:
-                shops = _filter_recommended(shops, state)
-            result = {"shops": shops, "count": len(shops)}
-            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
-            return result
+            return _postprocess_shop_results(shops, params, state, tool_name, started)
 
         elif tool_name == "search_shops_nearby":
             type_id = params.get("typeId")
             x = params.get("x") or params.get("user_x")
             y = params.get("y") or params.get("user_y")
             shops = await shop_api.search_shops_nearby(type_id, x, y)
-            max_price = params.get("maxPrice")
-            min_score = params.get("minScore")
-            if max_price:
-                shops = [s for s in shops if s.get("avgPrice", 999) <= max_price]
-            if min_score:
-                shops = [s for s in shops if normalize_score(s.get("score")) >= min_score]
-            for s in shops:
-                s["score"] = normalize_score(s.get("score"))
-            shops = rank_shops(shops)
-            # 过滤已推荐商铺
-            if state:
-                shops = _filter_recommended(shops, state)
-            result = {"shops": shops, "count": len(shops)}
-            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
-            return result
+            return _postprocess_shop_results(shops, params, state, tool_name, started)
 
         elif tool_name == "get_shop_detail":
             shop_id = params.get("shopId")
             shop = await shop_api.get_shop_detail(shop_id)
             shop["score"] = normalize_score(shop.get("score"))
-            result = {"shop": shop}
-            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
-            return result
+            return _finish_tool(tool_name, started, {"shop": shop})
 
         elif tool_name == "get_shop_types":
             types = await shop_api.get_shop_types()
-            result = {"types": types}
-            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
-            return result
+            return _finish_tool(tool_name, started, {"types": types})
 
         elif tool_name == "get_review_summary":
             shop_id = params.get("shopId")
-            result = await agent1_client.get_review_summary(shop_id)
-            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
-            return result
+            return _finish_tool(tool_name, started, await agent1_client.get_review_summary(shop_id))
 
         elif tool_name == "get_shop_reviews":
             shop_id = params.get("shopId")
             current = params.get("current", 1)
             reviews = await shop_api.get_shop_reviews(shop_id, current)
-            result = {"reviews": reviews, "count": len(reviews) if isinstance(reviews, list) else 0}
-            workflow_event("tool.completed", tool=tool_name, durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
-            return result
+            return _finish_tool(tool_name, started,
+                                {"reviews": reviews, "count": len(reviews) if isinstance(reviews, list) else 0})
 
         else:
             result = {"error": f"Unknown tool: {tool_name}"}
@@ -130,6 +94,35 @@ def _filter_recommended(shops: list[dict], state: AgentState) -> list[dict]:
     if len(filtered) < len(shops):
         logger.info(f"Filtered {len(shops) - len(filtered)} already-recommended shops")
     return filtered
+
+
+# --- 工具收尾 helper（须在 LangGraph 节点与装饰器之前定义）---
+
+def _finish_tool(tool_name: str, started: float, result: dict) -> dict:
+    """工具执行完成的统一收尾：打 tool.completed 事件并返回结果"""
+    workflow_event("tool.completed", tool=tool_name,
+                   durationMs=round((time.perf_counter() - started) * 1000, 1), result=result)
+    return result
+
+
+def _postprocess_shop_results(shops: list, params: dict, state, tool_name: str, started: float) -> dict:
+    """搜索结果共用的 client-side 后处理：
+    maxPrice/minScore 过滤 → score 归一化 → rank_shops 排序 → 过滤已推荐商铺 → tool.completed 事件。
+    （此前在 keyword/nearby 两个分支里各复制了一份，且过滤写法已出现分叉）
+    """
+    max_price = params.get("maxPrice")
+    min_score = params.get("minScore")
+    if max_price:
+        shops = [s for s in shops if float(s.get("avgPrice", 999)) <= max_price]
+    if min_score:
+        shops = [s for s in shops if normalize_score(s.get("score")) >= min_score]
+    for s in shops:
+        s["score"] = normalize_score(s.get("score"))
+    shops = rank_shops(shops)
+    # 过滤已推荐商铺
+    if state:
+        shops = _filter_recommended(shops, state)
+    return _finish_tool(tool_name, started, {"shops": shops, "count": len(shops)})
 
 
 # --- LangGraph 节点 ---

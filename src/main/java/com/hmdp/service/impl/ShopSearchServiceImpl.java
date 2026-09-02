@@ -1,6 +1,5 @@
 package com.hmdp.service.impl;
 
-import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.util.StrUtil;
 import com.hmdp.document.ShopDoc;
 import com.hmdp.dto.Result;
@@ -11,6 +10,7 @@ import com.hmdp.service.IShopService;
 import com.hmdp.annotation.CircuitBreaker;
 import com.hmdp.config.ElasticsearchConfiguration;
 import com.hmdp.service.IShopSearchService;
+import com.hmdp.utils.ShopDocConverter;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.extern.slf4j.Slf4j;
@@ -25,7 +25,6 @@ import org.springframework.data.elasticsearch.core.SearchHits;
 import org.springframework.data.elasticsearch.core.ElasticsearchRestTemplate;
 import org.springframework.data.elasticsearch.core.query.NativeSearchQuery;
 import org.springframework.data.elasticsearch.core.query.NativeSearchQueryBuilder;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
@@ -96,12 +95,6 @@ public class ShopSearchServiceImpl implements IShopSearchService {
      */
     @Resource
     private IShopService shopService;
-
-    /**
-     * Redis操作 —— 用于业务缓存
-     */
-    @Resource
-    private StringRedisTemplate stringRedisTemplate;
 
     /**
      * ES 索引初始化配置 —— 用于 rebuildIndex 管理接口复用 DROP+CREATE+MAPPING+IMPORT 主流程
@@ -464,25 +457,10 @@ public class ShopSearchServiceImpl implements IShopSearchService {
     }
 
     /**
-     * Shop实体转ShopDoc文档
-     *
-     * 【八股：为什么要做对象转换？】
-     * Shop是MySQL表映射实体，ShopDoc是ES文档映射。
-     * 两者字段大部分相同，但ShopDoc多了tags字段（用于搜索）。
-     * 不能直接用Shop存ES，因为：
-     * 1. Shop有createTime/updateTime等MySQL专有字段，ES不需要
-     * 2. ShopDoc的tags字段在Shop中不存在，需要额外填充
-     * 3. 分离实体让数据源职责清晰
+     * Shop实体转ShopDoc文档 —— 统一走 ShopDocConverter，
+     * 与 ElasticsearchConfiguration.importAllShops 全量重建保持完全一致
      */
     private ShopDoc convertToShopDoc(Shop shop) {
-        ShopDoc shopDoc = new ShopDoc();
-        // 使用hutool的BeanUtil复制同名字段
-        BeanUtil.copyProperties(shop, shopDoc);
-        // tags字段Shop中没有，用area填充作为搜索标签
-        // 实际项目中tags可来自商铺自选标签、分类名称等
-        if (StrUtil.isNotBlank(shop.getArea())) {
-            shopDoc.setTags(shop.getArea());
-        }
-        return shopDoc;
+        return ShopDocConverter.fromShop(shop);
     }
 }

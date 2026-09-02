@@ -20,7 +20,6 @@ import com.hmdp.utils.RedisConstants;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpSession;
 
 /**
  * <p>
@@ -60,8 +59,8 @@ public class UserController {
      */
     @PostMapping("code")
     @RateLimit(qps = 1, message = "验证码发送过于频繁，请稍后再试")
-    public Result sendCode(@RequestParam("phone") String phone, HttpSession session) {
-        return userService.sendCode(phone,session);
+    public Result sendCode(@RequestParam("phone") String phone) {
+        return userService.sendCode(phone);
     }
 
     /**
@@ -70,8 +69,8 @@ public class UserController {
      */
     @PostMapping("/login")
     @RateLimit(qps = 5, message = "登录操作过于频繁，请稍后再试")
-    public Result login(@RequestBody LoginFormDTO loginForm, HttpSession session){
-        return userService.login(loginForm,session);
+    public Result login(@RequestBody LoginFormDTO loginForm){
+        return userService.login(loginForm);
     }
 
     /**

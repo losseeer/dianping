@@ -3,19 +3,13 @@ package com.hmdp.interceptor;
 import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.util.StrUtil;
 import com.hmdp.dto.UserDTO;
-import com.hmdp.entity.User;
 import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.UserHolder;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.HandlerInterceptor;
-import org.springframework.web.servlet.ModelAndView;
 
-import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import javax.servlet.http.HttpSession;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -103,11 +97,10 @@ public class RefreshTokenInterceptor implements HandlerInterceptor {
 
     @Override
     public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) throws Exception {
-        // 【八股：这里应该调用UserHolder.removeUser()！】
-        // 本代码有个小问题：没有在afterCompletion中清理ThreadLocal
-        // 因为Tomcat用的是线程池，线程会被复用
-        // 如果不清理，下一个请求可能拿到上一个请求的用户信息，造成数据错乱
-        // 这是面试中的常见考点：ThreadLocal内存泄漏 + 线程复用导致的数据污染
-        // HandlerInterceptor.super.afterCompletion(request, response, handler, ex);
+        // 【八股：为什么必须在这里清理ThreadLocal？】
+        // Tomcat用线程池，线程会被复用。如果不清理，下一个复用该线程的请求
+        // 可能拿到上一个请求的用户身份，造成越权/数据串号。
+        // afterCompletion 无论请求成功还是抛异常都会执行，是清理的标准位置
+        UserHolder.removeUser();
     }
 }

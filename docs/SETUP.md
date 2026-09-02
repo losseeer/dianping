@@ -297,7 +297,7 @@ cd agent2 && python main.py &     # → http://localhost:8002
 按顺序执行，确保每步通过后再进入下一步：
 
 ```
-□ 1. MySQL    → mysql -h 127.0.0.1 -u root -p290390 dingping -e "SELECT 1"
+□ 1. MySQL    → mysql -h 127.0.0.1 -u root -p dingping -e "SELECT 1"（-p 交互式输入密码，勿明文写密码）
 □ 2. Redis    → redis-cli ping                        → PONG
 □ 3. RabbitMQ → curl -s http://localhost:15672        → 管理页面可访问
 □ 4. ES       → curl -s http://localhost:9200          → 返回 JSON
@@ -322,7 +322,7 @@ cd agent-services && bash start.sh
 | 中间件 | 端口 | 用户名 | 密码 | 备注 |
 |--------|------|--------|------|------|
 | **Java 后端** | `8081` | — | — | Spring Boot 主服务 |
-| **MySQL** | `3306` | `root` | `290390` | 数据库 `dingping` |
+| **MySQL** | `3306` | `root` | 本地自定（不写入文档） | 数据库 `dingping`；application.yaml 中 `spring.datasource.password` 留空=无密码 |
 | **Redis** | `6379` | — | — | 缓存 + 分布式锁 + 消息队列 |
 | **RabbitMQ** | `5672` | `guest` | `guest` | 管理面板 `15672` |
 | **Elasticsearch** | `9200` | — | — | 集群通信 `9300` |

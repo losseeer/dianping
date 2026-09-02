@@ -168,13 +168,22 @@ def reset_token_usage() -> TokenUsage:
 
 # ========== LLM 客户端 ==========
 
+_llm_instance: ChatOpenAI | None = None
+
+
 def get_llm() -> ChatOpenAI:
+    # 客户端实例进程内缓存：构造有开销，且模型/key/base_url 在进程生命周期内不变。
+    # ChatOpenAI 是无状态 Runnable，可安全地被并发的 ainvoke 共享。
+    global _llm_instance
+    if _llm_instance is not None:
+        return _llm_instance
+
     thinking = _os.getenv("LLM_THINKING", "disabled")
     extra_body = {}
     if thinking == "disabled":
         extra_body["thinking"] = {"type": "disabled"}
 
-    return ChatOpenAI(
+    _llm_instance = ChatOpenAI(
         model=config.LLM_MODEL,
         api_key=config.LLM_API_KEY,
         base_url=config.LLM_API_BASE,
@@ -188,6 +197,7 @@ def get_llm() -> ChatOpenAI:
         timeout=120,
         extra_body=extra_body,
     )
+    return _llm_instance
 
 
 # ========== Retry-After 解析 ==========
@@ -210,6 +220,32 @@ def _extract_retry_after(exc: Exception) -> Optional[float]:
             return None
     except Exception:
         return None
+
+
+def _emit_retry(call_id: str, attempt: int, reason: str, delay: float,
+                status: int | None = None, error_type: str | None = None) -> None:
+    workflow_event(
+        "llm.retry_scheduled",
+        level=logging.WARNING,
+        callId=call_id,
+        attempt=attempt,
+        statusCode=status,
+        reason=reason,
+        delayMs=round(delay * 1000, 1),
+        errorType=error_type,
+    )
+
+
+def _emit_failed(call_id: str, attempt: int, error: Exception, status: int | None = None) -> None:
+    workflow_event(
+        "llm.failed",
+        level=logging.ERROR,
+        callId=call_id,
+        attempt=attempt,
+        statusCode=status,
+        errorType=type(error).__name__,
+        error=str(error),
+    )
 
 
 # ========== 统一调用入口 ==========
@@ -265,14 +301,7 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
                 raise
             delay = _backoff_delay(attempt)
             logger.warning(f"call_llm 令牌桶排队超时，{delay:.1f}s 后重试 (attempt={attempt}/{max_attempts})")
-            workflow_event(
-                "llm.retry_scheduled",
-                level=logging.WARNING,
-                callId=call_id,
-                attempt=attempt,
-                reason="rate_limit_queue_timeout",
-                delayMs=round(delay * 1000, 1),
-            )
+            _emit_retry(call_id, attempt, "rate_limit_queue_timeout", delay)
             await _asyncio.sleep(delay)
             continue
 
@@ -304,27 +333,11 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
             # 不可重试：4xx（400 参数错、401 鉴权错、403 无权限）——重试同样的请求必然再失败，
             # 无脑重试只会浪费配额。这是重试设计的通用原则：只重试「可能自愈」的故障
             if status not in (429, 500, 502, 503, 504):
-                workflow_event(
-                    "llm.failed",
-                    level=logging.ERROR,
-                    callId=call_id,
-                    attempt=attempt,
-                    statusCode=status,
-                    errorType=type(e).__name__,
-                    error=str(e),
-                )
+                _emit_failed(call_id, attempt, e, status=status)
                 raise
             if attempt == max_attempts:
                 logger.warning(f"call_llm 放弃重试 (attempt={attempt}, status={status}): {e}")
-                workflow_event(
-                    "llm.failed",
-                    level=logging.ERROR,
-                    callId=call_id,
-                    attempt=attempt,
-                    statusCode=status,
-                    errorType=type(e).__name__,
-                    error=str(e),
-                )
+                _emit_failed(call_id, attempt, e, status=status)
                 raise
             # ④ 退避：优先 Retry-After，否则指数退避 + jitter
             retry_after = _extract_retry_after(e)
@@ -334,15 +347,7 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
                 f"(attempt={attempt}/{max_attempts})"
                 + (f" [Retry-After={retry_after}]" if retry_after else "")
             )
-            workflow_event(
-                "llm.retry_scheduled",
-                level=logging.WARNING,
-                callId=call_id,
-                attempt=attempt,
-                statusCode=status,
-                reason="retryable_api_error",
-                delayMs=round(delay * 1000, 1),
-            )
+            _emit_retry(call_id, attempt, "retryable_api_error", delay, status=status)
             await _asyncio.sleep(delay)
 
         except Exception as e:
@@ -359,15 +364,7 @@ async def call_llm(messages: list[BaseMessage]) -> BaseMessage:
                 raise
             delay = _backoff_delay(attempt)
             logger.warning(f"call_llm 异常: {e}, {delay:.1f}s 后重试 (attempt={attempt}/{max_attempts})")
-            workflow_event(
-                "llm.retry_scheduled",
-                level=logging.WARNING,
-                callId=call_id,
-                attempt=attempt,
-                reason="unexpected_error",
-                delayMs=round(delay * 1000, 1),
-                errorType=type(e).__name__,
-            )
+            _emit_retry(call_id, attempt, "unexpected_error", delay, error_type=type(e).__name__)
             await _asyncio.sleep(delay)
 
         finally:

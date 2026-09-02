@@ -8,10 +8,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
-import org.aspectj.lang.reflect.MethodSignature;
 import org.springframework.stereotype.Component;
 
-import java.lang.reflect.Method;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -117,9 +115,6 @@ public class CircuitBreakerAspect {
         // 检查滑动窗口是否需要重置
         checkAndResetSlidingWindow(breaker, circuitBreaker);
 
-        // 统计总请求数
-        breaker.getTotalCount().incrementAndGet();
-
         try {
             // 执行原方法
             Object result = joinPoint.proceed();
@@ -195,32 +190,12 @@ public class CircuitBreakerAspect {
         return Result.fail(cb.message());
     }
 
-    /**
-     * 获取方法标识
-     */
     private String getMethodName(ProceedingJoinPoint joinPoint) {
-        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
-        Method method = signature.getMethod();
-        return method.getDeclaringClass().getSimpleName() + "." + method.getName();
+        return AspectFallbackSupport.getMethodName(joinPoint);
     }
 
-    /**
-     * 反射调用降级方法
-     */
     private Object invokeFallback(ProceedingJoinPoint joinPoint, String fallbackName) throws Throwable {
-        try {
-            MethodSignature signature = (MethodSignature) joinPoint.getSignature();
-            Method fallbackMethod = signature.getDeclaringType().getDeclaredMethod(
-                    fallbackName, signature.getParameterTypes());
-            fallbackMethod.setAccessible(true);
-            Object target = joinPoint.getTarget();
-            return fallbackMethod.invoke(target, joinPoint.getArgs());
-        } catch (NoSuchMethodException e) {
-            log.error("降级方法不存在: {}", fallbackName, e);
-            return Result.fail("服务暂时不可用，请稍后再试");
-        } catch (Exception e) {
-            log.error("降级方法执行异常: {}", fallbackName, e);
-            return Result.fail("服务暂时不可用，请稍后再试");
-        }
+        return AspectFallbackSupport.invokeFallback(
+                joinPoint, fallbackName, Result.fail("服务暂时不可用，请稍后再试"));
     }
 }

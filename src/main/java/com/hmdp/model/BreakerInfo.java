@@ -37,11 +37,6 @@ public class BreakerInfo {
     private final AtomicInteger failureCount = new AtomicInteger(0);
 
     /**
-     * 当前滑动窗口内的总请求次数（用于算失败率）
-     */
-    private final AtomicInteger totalCount = new AtomicInteger(0);
-
-    /**
      * 最近一次失败发生的时间戳
      */
     private volatile long lastFailureTime = 0L;
@@ -63,7 +58,6 @@ public class BreakerInfo {
      */
     public void resetCounters() {
         failureCount.set(0);
-        totalCount.set(0);
         probeSent.set(false);
     }
 }

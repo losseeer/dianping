@@ -84,6 +84,82 @@ def _save_interrupt_state(thread_id: str, state: AgentState) -> None:
     )
 
 
+async def _finalize_graph_result(
+    thread_id: str,
+    state: AgentState,
+    user_id: int,
+    *,
+    source: str,
+    clear_hitl_state: bool,
+) -> dict:
+    """图执行完毕后的统一收尾（chat 与 resume 两个端点共用，避免两边各维护一份）。
+
+    - 记录 token 用量与 graph.completed 事件
+    - 仍需 HITL → 保存中断快照并返回 interrupt 响应
+    - 否则 → 助手消息落库、更新推荐去重缓存，返回 recommendation 响应
+
+    source: 事件名前缀（"chat" / "resume"）
+    clear_hitl_state: resume 路径恢复成功后清理 HITL 快照
+    """
+    token_usage = get_token_usage()
+    update_workflow_context(trajectoryId=state.trajectory_id)
+    workflow_event(
+        "graph.completed",
+        nodeCount=len(state.node_logs),
+        candidateCount=len(state.candidate_shops),
+        iterationCount=state.iteration_count,
+        hitlNeeded=state.hitl_needed,
+        tokenUsage=token_usage,
+    )
+
+    if state.hitl_needed:
+        _save_interrupt_state(thread_id, state)
+        workflow_event(
+            "hitl.interrupted",
+            question=state.hitl_question,
+            options=state.hitl_options,
+            hitlReason=state.hitl_reason,
+        )
+        return {
+            "type": "interrupt",
+            "question": state.hitl_question,
+            "options": state.hitl_options,
+            "threadId": thread_id,
+            "tokenUsage": token_usage,
+        }
+
+    from memory.conversation import append_turn, save_last_shops, add_recommended_ids
+
+    if clear_hitl_state:
+        delete_hitl_state(thread_id)
+        workflow_event("hitl.state_deleted", threadId=thread_id)
+    assistant_msg = state.final_recommendation or json.dumps(state.ranked_shops[:3], ensure_ascii=False)
+    await append_turn(thread_id, user_id, "assistant", assistant_msg)
+    save_last_shops(thread_id, state.ranked_shops or [])
+    # 保存本轮推荐的商铺 ID，供下一轮去重
+    _new_ids = [s.get("id") or s.get("shopId") for s in (state.ranked_shops or []) if s.get("id") or s.get("shopId")]
+    if _new_ids:
+        add_recommended_ids(thread_id, _new_ids)
+    workflow_event(
+        f"{source}.recommendation_completed",
+        shopCount=len(state.ranked_shops),
+        memoryUpdated=state.memory_updated,
+        trajectoryId=state.trajectory_id,
+    )
+    return {
+        "type": "recommendation",
+        "shops": state.ranked_shops,
+        "finalRecommendation": state.final_recommendation,
+        "memoryUpdated": state.memory_updated,
+        "newPreferences": state.new_preferences,
+        "threadId": thread_id,
+        "reflectionScore": state.reflection_score,
+        "reflectionNotes": state.reflection_notes,
+        "trajectoryId": state.trajectory_id,
+        "tokenUsage": token_usage,
+    }
+
+
 # --- 核心 API（生产必需，不可删） ---
 
 @app.post("/agent2/chat")
@@ -98,7 +174,7 @@ async def chat_endpoint(req: ChatRequest):
         resumed=bool(req.threadId),
     )
     try:
-        from memory.conversation import append_turn, save_last_shops, get_recommended_ids, add_recommended_ids
+        from memory.conversation import append_turn, get_recommended_ids
 
         # 防御性校验：拒绝匿名 userId
         if not req.userId or req.userId <= 0:
@@ -122,58 +198,8 @@ async def chat_endpoint(req: ChatRequest):
         workflow_event("graph.started", entryNode="load_memory")
         result_state = await run_graph(initial_state.model_dump())
         state = AgentState(**result_state)
-        token_usage = get_token_usage()
-        update_workflow_context(trajectoryId=state.trajectory_id)
-        workflow_event(
-            "graph.completed",
-            nodeCount=len(state.node_logs),
-            candidateCount=len(state.candidate_shops),
-            iterationCount=state.iteration_count,
-            hitlNeeded=state.hitl_needed,
-            tokenUsage=token_usage,
-        )
-
-        if state.hitl_needed:
-            _save_interrupt_state(thread_id, state)
-            workflow_event(
-                "hitl.interrupted",
-                question=state.hitl_question,
-                options=state.hitl_options,
-                hitlReason=state.hitl_reason,
-            )
-            return {
-                "type": "interrupt",
-                "question": state.hitl_question,
-                "options": state.hitl_options,
-                "threadId": thread_id,
-                "tokenUsage": token_usage,
-            }
-        else:
-            assistant_msg = state.final_recommendation or json.dumps(state.ranked_shops[:3], ensure_ascii=False)
-            await append_turn(thread_id, req.userId, "assistant", assistant_msg)
-            save_last_shops(thread_id, state.ranked_shops or [])
-            # 保存本轮推荐的商铺 ID，供下一轮去重
-            _new_ids = [s.get("id") or s.get("shopId") for s in (state.ranked_shops or []) if s.get("id") or s.get("shopId")]
-            if _new_ids:
-                add_recommended_ids(thread_id, _new_ids)
-            workflow_event(
-                "chat.recommendation_completed",
-                shopCount=len(state.ranked_shops),
-                memoryUpdated=state.memory_updated,
-                trajectoryId=state.trajectory_id,
-            )
-            return {
-                "type": "recommendation",
-                "shops": state.ranked_shops,
-                "finalRecommendation": state.final_recommendation,
-                "memoryUpdated": state.memory_updated,
-                "newPreferences": state.new_preferences,
-                "threadId": thread_id,
-                "reflectionScore": state.reflection_score,
-                "reflectionNotes": state.reflection_notes,
-                "trajectoryId": state.trajectory_id,
-                "tokenUsage": token_usage,
-            }
+        return await _finalize_graph_result(
+            thread_id, state, req.userId, source="chat", clear_hitl_state=False)
 
     except LLMBusyError as e:
         logger.warning(f"Agent2 chat LLM busy: {e}")
@@ -195,7 +221,7 @@ async def resume_endpoint(req: ResumeRequest):
         hasCoordinates=req.x is not None and req.y is not None,
     )
     try:
-        from memory.conversation import append_turn, save_last_shops, get_recommended_ids, add_recommended_ids
+        from memory.conversation import append_turn, get_recommended_ids
 
         # 防御性校验：拒绝匿名 userId
         if not req.userId or req.userId <= 0:
@@ -237,60 +263,8 @@ async def resume_endpoint(req: ResumeRequest):
             )
         result_state = {k: v for k, v in result_state.items() if k != "__interrupt__"}
         state = AgentState(**result_state)
-        token_usage = get_token_usage()
-        update_workflow_context(trajectoryId=state.trajectory_id)
-        workflow_event(
-            "graph.completed",
-            nodeCount=len(state.node_logs),
-            candidateCount=len(state.candidate_shops),
-            iterationCount=state.iteration_count,
-            hitlNeeded=state.hitl_needed,
-            tokenUsage=token_usage,
-        )
-
-        if state.hitl_needed:
-            _save_interrupt_state(thread_id, state)
-            workflow_event(
-                "hitl.interrupted",
-                question=state.hitl_question,
-                options=state.hitl_options,
-                hitlReason=state.hitl_reason,
-            )
-            return {
-                "type": "interrupt",
-                "question": state.hitl_question,
-                "options": state.hitl_options,
-                "threadId": thread_id,
-                "tokenUsage": token_usage,
-            }
-        else:
-            delete_hitl_state(thread_id)
-            workflow_event("hitl.state_deleted", threadId=thread_id)
-            assistant_msg = state.final_recommendation or json.dumps(state.ranked_shops[:3], ensure_ascii=False)
-            await append_turn(thread_id, state.user_id, "assistant", assistant_msg)
-            save_last_shops(thread_id, state.ranked_shops or [])
-            # 保存本轮推荐的商铺 ID，供下一轮去重
-            _new_ids = [s.get("id") or s.get("shopId") for s in (state.ranked_shops or []) if s.get("id") or s.get("shopId")]
-            if _new_ids:
-                add_recommended_ids(thread_id, _new_ids)
-            workflow_event(
-                "resume.recommendation_completed",
-                shopCount=len(state.ranked_shops),
-                memoryUpdated=state.memory_updated,
-                trajectoryId=state.trajectory_id,
-            )
-            return {
-                "type": "recommendation",
-                "shops": state.ranked_shops,
-                "finalRecommendation": state.final_recommendation,
-                "memoryUpdated": state.memory_updated,
-                "newPreferences": state.new_preferences,
-                "threadId": thread_id,
-                "reflectionScore": state.reflection_score,
-                "reflectionNotes": state.reflection_notes,
-                "trajectoryId": state.trajectory_id,
-                "tokenUsage": token_usage,
-            }
+        return await _finalize_graph_result(
+            thread_id, state, state.user_id, source="resume", clear_hitl_state=True)
 
     except LLMBusyError as e:
         logger.warning(f"Agent2 resume LLM busy: {e}")
@@ -439,14 +413,14 @@ async def health():
 async def startup():
     """启动时：拉起自进化蒸馏 daemon（兜底后台任务，每 5 分钟补跑一批轨迹蒸馏）"""
     workflow_event("service.started", service="agent2", port=config.AGENT2_PORT)
-    from improve.signals import start_distill_daemon
+    from improve.worker import start_distill_daemon
     start_distill_daemon(app)
 
 
 @app.on_event("shutdown")
 async def shutdown():
     workflow_event("service.stopping", service="agent2")
-    from improve.signals import cancel_distill_daemon
+    from improve.worker import cancel_distill_daemon
     cancel_distill_daemon(app)
     await shop_api.close()
     from core.agent1_client import agent1_client

@@ -4,7 +4,6 @@ import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
-import com.hmdp.entity.Shop;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -216,13 +215,10 @@ public class CacheClient {
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }finally {
-                    //释放锁
-                    // 【已知缺陷，面试可主动讲】这里传的是数据key而非lockKey：
-                    // 1) 锁key从未被删除，只能等10s过期自动释放（靠TTL兜底，期间其他线程抢不到锁）
-                    // 2) unLock误删了缓存数据key本身，等于把逻辑过期的缓存直接清空，
-                    //    下次请求会走到"isBlank返回null"，防击穿失效
-                    // 正确写法：unLock(lockKey)
-                    unLock(key);
+                    //释放锁：必须传lockKey。历史bug曾误传数据key，导致
+                    // 1) 锁key只能等10s TTL兜底释放，期间其他重建线程抢不到锁
+                    // 2) 缓存数据key被误删，逻辑过期防击穿失效
+                    unLock(lockKey);
                 }
             });
 
@@ -279,8 +275,7 @@ public class CacheClient {
      * 锁的value存一个唯一标识（比如UUID+线程ID）
      * 释放锁时先判断是不是自己的锁，是自己的才删除
      * 而且"判断+删除"也必须是原子操作，要用Lua脚本
-     *
-     * （详见 SimpleRedisLock 类，那个是改进版）
+     * （生产级实现见 Redisson：可重入Hash结构 + 看门狗续期，本项目秒杀已采用）
      */
     private void unLock(String key){
         stringRedisTemplate.delete(key);

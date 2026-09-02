@@ -3,7 +3,6 @@ package com.hmdp.service.impl;
 import cn.hutool.core.util.StrUtil;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
-import com.hmdp.service.IBlogService;
 import com.hmdp.service.IRecommendService;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.RedisConstants;
@@ -93,13 +92,6 @@ public class RecommendServiceImpl implements IRecommendService {
 
     @Resource
     private IShopService shopService;
-
-    /**
-     * Blog服务 —— 用于查询博客相关数据
-     * 在协同过滤中，可通过Blog获取用户与商铺的互动关系
-     */
-    @Resource
-    private IBlogService blogService;
 
     /**
      * 推荐列表默认返回数量
@@ -194,15 +186,12 @@ public class RecommendServiceImpl implements IRecommendService {
         }
 
         // 5.按出现次数（推荐权重）降序排序，取TopN
+        // shopCountMap 已保证非空，limit 后不可能为空，无需重复判断
         List<String> recommendedShopIds = shopCountMap.entrySet().stream()
                 .sorted((a, b) -> b.getValue().compareTo(a.getValue()))
                 .limit(RECOMMEND_LIMIT)
                 .map(Map.Entry::getKey)
                 .collect(Collectors.toList());
-
-        if (recommendedShopIds.isEmpty()) {
-            return hotShops();
-        }
 
         // 6.根据推荐排序的shopId列表查询商铺详情
         // 使用ORDER BY FIELD保持推荐顺序（出现次数高的排前面）
@@ -254,11 +243,11 @@ public class RecommendServiceImpl implements IRecommendService {
             return hotShops();
         }
 
-        // 1.如果没有指定类型，直接从MySQL查热门
+        // 1.如果没有指定类型，直接从MySQL查热门（排序口径与 hotShops 一致：销量优先）
         if (typeId == null) {
             List<Shop> shops = shopService.query()
-                    .orderByDesc("score")
                     .orderByDesc("sold")
+                    .orderByDesc("score")
                     .last("limit " + HOT_LIMIT)
                     .list();
             return Result.ok(shops);
@@ -298,22 +287,10 @@ public class RecommendServiceImpl implements IRecommendService {
         // 4.根据ID查询商铺详情
         List<Shop> shops = shopService.listByIds(ids);
 
-        // 5.按评分和销量排序（GEO结果按距离排序，这里按热门度重排）
-        shops.sort((a, b) -> {
-            // 先按评分降序
-            int scoreCompare = Integer.compare(
-                    b.getScore() == null ? 0 : b.getScore(),
-                    a.getScore() == null ? 0 : a.getScore()
-            );
-            if (scoreCompare != 0) {
-                return scoreCompare;
-            }
-            // 再按销量降序
-            return Integer.compare(
-                    b.getSold() == null ? 0 : b.getSold(),
-                    a.getSold() == null ? 0 : a.getSold()
-            );
-        });
+        // 5.按热门度重排（GEO结果本身按距离排序；口径与 hotShops 一致：销量优先，评分次之）
+        shops.sort(java.util.Comparator
+                .comparing((Shop s) -> s.getSold() == null ? 0 : s.getSold(), java.util.Comparator.reverseOrder())
+                .thenComparing(s -> s.getScore() == null ? 0 : s.getScore(), java.util.Comparator.reverseOrder()));
 
         // 6.填充距离信息
         for (Shop shop : shops) {

@@ -4,30 +4,26 @@ import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.bean.copier.CopyOptions;
 import cn.hutool.core.lang.UUID;
 import cn.hutool.core.util.RandomUtil;
-import com.baomidou.mybatisplus.extension.conditions.query.LambdaQueryChainWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.LoginFormDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.User;
 import com.hmdp.mapper.UserMapper;
+import org.springframework.dao.DuplicateKeyException;
 import com.hmdp.service.IUserService;
 import com.hmdp.utils.*;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.connection.BitFieldSubCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
-import javax.servlet.http.HttpSession;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.USER_SIGN_KEY;
@@ -60,7 +56,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
      * @return
      */
     @Override
-    public Result sendCode(String phone, HttpSession session) {
+    public Result sendCode(String phone) {
         //1.校验手机号
         if(RegexUtils.isPhoneInvalid(phone)) {
             //2.不符合，返回错误
@@ -123,7 +119,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
      * @return
      */
     @Override
-    public Result login(LoginFormDTO loginForm, HttpSession session) {
+    public Result login(LoginFormDTO loginForm) {
         String code = loginForm.getCode();
         String phone = loginForm.getPhone();
         //1.校验手机号
@@ -211,8 +207,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // - 一个月的数据量小，操作快
         // - 方便按月统计（连续签到、月签到天数）
         // - 过期清理方便（上个月的直接整个key过期）
-        String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
-        String key = USER_SIGN_KEY + userId + keySuffix;
+        String key = buildSignKey(userId, now);
         //4.获取今天是这个月的第几天
         int dayOfMonth = now.getDayOfMonth();
         //5.写入redis setbit key offset 1
@@ -252,9 +247,8 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         Long userId = UserHolder.getUser().getId();
         //2.获取日期
         LocalDateTime now = LocalDateTime.now();
-        //3.拼接key
-        String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
-        String key = USER_SIGN_KEY + userId + keySuffix;
+        //3.拼接key（复用 sign() 的构建逻辑）
+        String key = buildSignKey(userId, now);
         //4.获取今天是这个月的第几天
         int dayOfMonth = now.getDayOfMonth();
         //5.获取本月截止今天为止所有的签到记录，返回的是一个十进制的数字
@@ -272,7 +266,8 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
             return Result.ok(0);
         }
         Long num = result.get(0);
-        if(num==0||num==null){
+        // 注意判断顺序：num 为 null 时 num==0 会拆箱抛 NPE，必须先判 null
+        if (num == null || num == 0) {
             return Result.ok(0);
         }
         //6.循坏遍历
@@ -301,13 +296,26 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
 
     }
 
+    /**
+     * 构造签到 BitMap 的 key：sign:userId:yyyyMM，按用户+月份分key，
+     * 方便按月统计（连续签到）与过期清理（上个月整个key过期）
+     */
+    private String buildSignKey(Long userId, LocalDateTime now) {
+        return USER_SIGN_KEY + userId + now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+    }
+
     private User createUserWithPhone(String phone) {
         User user = new User();
         user.setPhone(phone);
         user.setNickName(SystemConstants.USER_NICK_NAME_PREFIX +RandomUtil.randomString(10));
         //保存
-        save(user);
+        try {
+            save(user);
+        } catch (DuplicateKeyException e) {
+            // 并发首登兜底：同手机号同时注册，唯一索引(tb_user.phone)拦住后一个插入，
+            // 回查对方已创建的记录，保证两次登录拿到同一个 userId
+            return query().eq("phone", phone).one();
+        }
         return user;
-
     }
 }

@@ -1,7 +1,6 @@
 package com.hmdp.utils;
 
 import com.hmdp.dto.UserDTO;
-import com.hmdp.entity.User;
 
 /**
  * 用户上下文持有者 —— 【八股：ThreadLocal 原理与内存泄漏】

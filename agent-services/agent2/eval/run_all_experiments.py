@@ -35,10 +35,10 @@ def setup_mock():
     """Mock Agent1 未启动的部分"""
     _orig_exec = gn.execute_tool
 
-    async def _patched(tool_name, params):
+    async def _patched(tool_name, params, state=None):
         if tool_name == "get_review_summary":
             return {"recommendation": "分析中", "topPros": [], "topCons": []}
-        return await _orig_exec(tool_name, params)
+        return await _orig_exec(tool_name, params, state)
 
     gn.execute_tool = _patched
     jc.shop_api = shop_api_mysql

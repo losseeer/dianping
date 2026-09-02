@@ -1,6 +1,5 @@
 package com.hmdp.config;
 
-import com.hmdp.utils.RedisConstants;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
 import org.redisson.config.Config;

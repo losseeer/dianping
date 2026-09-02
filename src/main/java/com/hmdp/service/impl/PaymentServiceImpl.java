@@ -1,17 +1,15 @@
 package com.hmdp.service.impl;
 
-import cn.hutool.json.JSONUtil;
 import com.hmdp.dto.PaymentDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.PayLog;
 import com.hmdp.entity.VoucherOrder;
-import com.hmdp.entity.TransactionOutbox;
 import com.hmdp.enums.OrderStatus;
 import com.hmdp.enums.PayType;
 import com.hmdp.service.IPaymentService;
 import com.hmdp.service.ISeckillVoucherService;
-import com.hmdp.mapper.TransactionOutboxMapper;
 import com.hmdp.listener.TransactionOutboxPublisher;
+import com.hmdp.listener.TransactionOutboxWriter;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -86,7 +84,7 @@ public class PaymentServiceImpl implements IPaymentService {
     private IPaymentService selfProxy;
 
     @Resource
-    private TransactionOutboxMapper outboxMapper;
+    private TransactionOutboxWriter outboxWriter;
 
 
     /**
@@ -114,6 +112,7 @@ public class PaymentServiceImpl implements IPaymentService {
     @Override
     @Transactional
     public Result payOrder(PaymentDTO dto) {
+        // 1. 校验参数与支付方式
         Long orderId = dto.getOrderId();
         Integer payType = dto.getPayType();
         if (orderId == null || payType == null) {
@@ -126,7 +125,7 @@ public class PaymentServiceImpl implements IPaymentService {
             return Result.fail("不支持的支付方式");
         }
 
-        // 1. 查订单是否存在、是否是待支付状态（先DB、再Redis pending，防止异步落库窗口"订单不存在"）
+        // 2. 查订单并校验归属/状态（先DB、再Redis pending，防止异步落库窗口"订单不存在"）
         VoucherOrder order = voucherOrderService.getOrderWithPending(orderId);
         if (order == null) {
             return Result.fail("订单不存在");
@@ -139,23 +138,8 @@ public class PaymentServiceImpl implements IPaymentService {
         if (currentStatus != OrderStatus.UNPAID) {
             return Result.fail("订单状态不允许支付: " + currentStatus.getDesc());
         }
-
-        // 1.5 如果订单还没真正落库（仍处于 pending 状态），主动立即落库一次（幂等），
-        //     否则下面的 updateById(order)、以及后续支付回调里的 getById 都找不到 DB 记录。
-        VoucherOrder dbOrder = voucherOrderService.getById(orderId);
-        if (dbOrder == null) {
-            log.info("支付时订单尚未落库，主动同步执行落库，orderId={}", orderId);
-            try {
-                voucherOrderService.handleVoucherOrder(order);
-            } catch (Exception e) {
-                log.error("主动同步落库失败，orderId={}", orderId, e);
-                return Result.fail("订单创建中，请稍后再试");
-            }
-            dbOrder = voucherOrderService.getById(orderId);
-            if (dbOrder == null) {
-                return Result.fail("订单创建中，请稍后再试");
-            }
-            order = dbOrder;
+        if (!ensureOrderSynced(orderId, order)) {
+            return Result.fail("订单创建中，请稍后再试");
         }
         VoucherOrder lockedOrder = voucherOrderService.getBaseMapper().selectByIdForUpdate(orderId);
         if (lockedOrder == null) {
@@ -163,15 +147,16 @@ public class PaymentServiceImpl implements IPaymentService {
         }
         order = lockedOrder;
         if (!Integer.valueOf(OrderStatus.UNPAID.getCode()).equals(order.getStatus())) {
-            return Result.fail("订单状态不允许支付: " + OrderStatus.of(order.getStatus()).getDesc());
+            return Result.fail("订单状态不允许支付: " + OrderStatus.descOf(order.getStatus()));
         }
 
-        // 2. 使用下单时快照金额，避免优惠券改价影响历史订单。
+        // 3. 使用下单时快照金额，避免优惠券改价影响历史订单。
         Long amount = order.getAmount();
         if (amount == null || amount <= 0) {
             return Result.fail("支付金额异常");
         }
 
+        // 4. 防重复支付：同支付方式的待支付流水直接复用，不同方式的拒绝叠加
         PayLog existingPayLog = payLogService.query()
                 .eq("order_id", orderId)
                 .eq("status", 1)
@@ -185,31 +170,13 @@ public class PaymentServiceImpl implements IPaymentService {
             return Result.fail("订单已有待支付流水，请完成或取消原支付");
         }
 
-        // 3. 创建PayLog记录（status=1待支付）
-        PayLog payLog = new PayLog();
-        payLog.setOrderId(orderId);
-        payLog.setUserId(order.getUserId());
-        payLog.setPayType(payType);
-        payLog.setAmount(amount);
-        payLog.setStatus(1); // 1=待支付
-        payLog.setPendingFlag(1);
-        payLog.setCreateTime(LocalDateTime.now());
-
-        // 4. 模拟生成第三方支付流水号 —— UUID
-        String tradeNo = UUID.randomUUID().toString().replace("-", "");
-        payLog.setTradeNo(tradeNo);
-
-        // 保存支付流水
-        payLogService.save(payLog);
-        log.info("创建支付流水: orderId={}, tradeNo={}, amount={}分, payType={}",
-                orderId, tradeNo, amount, PayType.of(payType).getDesc());
-
-        // 5. 模拟调用支付SDK（这里直接返回支付链接/二维码URL）
+        // 5. 创建待支付流水（status=1）
+        PayLog payLog = createPendingPayLog(order, amount, payTypeEnum);
+        // 支付链接/二维码URL在 buildPayResult 里按 tradeNo 重新生成
         // 【八股：真实支付SDK的调用流程】
         // 微信支付：调用统一下单API → 返回prepay_id → 生成二维码
         // 支付宝：调用alipay.trade.precreate → 返回二维码链接
-        // 这里模拟返回一个支付URL，前端展示为二维码
-        String payUrl = simulatePaySdk(tradeNo, amount, payType);
+        // 本项目 simulatePaySdk 模拟返回一个支付URL，前端展示为二维码
 
         // 6. 只更新仍处于待支付状态的订单，不能用旧实体覆盖并发取消结果
         boolean payTypeSaved = voucherOrderService.lambdaUpdate()
@@ -231,16 +198,68 @@ public class PaymentServiceImpl implements IPaymentService {
         //    所以余额支付直接 mock 回调：既保留真实沙箱的 PayLog/tradeNo/payUrl 字段，
         //    又保证订单状态与前端体验一致。其他 payType（微信/支付宝）仍走二维码+回调。
         if (payTypeEnum == PayType.BALANCE) {
-            Result notifyResult = selfProxy.handlePayNotify(tradeNo, orderId, amount);
-            if (notifyResult != null && Boolean.FALSE.equals(notifyResult.getSuccess())) {
-                throw new IllegalStateException("余额支付失败: " + notifyResult.getErrorMsg());
-            } else {
-                log.info("余额支付自动完成回调：orderId={}, tradeNo={}", orderId, tradeNo);
-            }
+            completeBalancePay(payLog.getTradeNo(), orderId, amount);
         }
 
         // 返回支付信息（包含支付链接和流水号）
         return Result.ok(buildPayResult(payLog));
+    }
+
+    /**
+     * 步骤2的后半段：订单还没真正落库（仍处于 pending 状态）时，主动同步落库一次（幂等），
+     * 否则后续支付回调里的 getById 找不到 DB 记录。
+     *
+     * @return true=订单已确认落库；false=同步落库失败（调用方提示"订单创建中"）
+     */
+    private boolean ensureOrderSynced(Long orderId, VoucherOrder pendingOrder) {
+        if (voucherOrderService.getById(orderId) != null) {
+            return true;
+        }
+        log.info("支付时订单尚未落库，主动同步执行落库，orderId={}", orderId);
+        try {
+            voucherOrderService.handleVoucherOrder(pendingOrder);
+        } catch (Exception e) {
+            log.error("主动同步落库失败，orderId={}", orderId, e);
+            return false;
+        }
+        return voucherOrderService.getById(orderId) != null;
+    }
+
+    /**
+     * 创建待支付流水（status=1）并生成模拟第三方流水号。
+     *
+     * 【八股：UUID作为第三方流水号的模拟】
+     * 真实场景中，tradeNo由第三方支付平台生成并返回
+     * 这里用UUID模拟，格式：550e8400-e29b-41d4-a716-446655440000
+     * UUID的冲突概率极低（2^122种可能），适合做唯一标识
+     */
+    private PayLog createPendingPayLog(VoucherOrder order, Long amount, PayType payTypeEnum) {
+        PayLog payLog = new PayLog();
+        payLog.setOrderId(order.getId());
+        payLog.setUserId(order.getUserId());
+        payLog.setPayType(payTypeEnum.getCode());
+        payLog.setAmount(amount);
+        payLog.setStatus(1); // 1=待支付
+        payLog.setPendingFlag(1);
+        payLog.setCreateTime(LocalDateTime.now());
+        payLog.setTradeNo(UUID.randomUUID().toString().replace("-", ""));
+
+        payLogService.save(payLog);
+        log.info("创建支付流水: orderId={}, tradeNo={}, amount={}分, payType={}",
+                order.getId(), payLog.getTradeNo(), amount, payTypeEnum.getDesc());
+        return payLog;
+    }
+
+    /**
+     * 余额支付直接 mock 第三方回调，同步把订单置为已支付（见 payOrder 步骤7 的说明）。
+     * 失败抛异常回滚整个支付事务。
+     */
+    private void completeBalancePay(String tradeNo, Long orderId, Long amount) {
+        Result notifyResult = selfProxy.handlePayNotify(tradeNo, orderId, amount);
+        if (notifyResult != null && Boolean.FALSE.equals(notifyResult.getSuccess())) {
+            throw new IllegalStateException("余额支付失败: " + notifyResult.getErrorMsg());
+        }
+        log.info("余额支付自动完成回调：orderId={}, tradeNo={}", orderId, tradeNo);
     }
 
     private Map<String, Object> buildPayResult(PayLog payLog) {
@@ -313,14 +332,9 @@ public class PaymentServiceImpl implements IPaymentService {
         }
 
         // 2. 先以条件更新抢占订单支付状态，取消/支付只能有一方成功
+        // 3. 更新PayLog为成功（见 markPayLogPaid，条件更新保证幂等）
         if (Integer.valueOf(OrderStatus.CANCELLED.getCode()).equals(order.getStatus())) {
-            boolean paidLate = payLogService.update()
-                    .set("status", 2)
-                    .set("pending_flag", null)
-                    .set("pay_time", LocalDateTime.now())
-                    .eq("id", payLog.getId())
-                    .eq("status", 1)
-                    .update();
+            boolean paidLate = markPayLogPaid(payLog.getId());
             if (!paidLate) {
                 return Result.fail("支付流水状态异常");
             }
@@ -342,13 +356,7 @@ public class PaymentServiceImpl implements IPaymentService {
             return Result.fail("订单状态不允许支付");
         }
 
-        boolean payLogChanged = payLogService.update()
-                .set("status", 2)
-                .set("pending_flag", null)
-                .set("pay_time", LocalDateTime.now())
-                .eq("id", payLog.getId())
-                .eq("status", 1)
-                .update();
+        boolean payLogChanged = markPayLogPaid(payLog.getId());
         if (!payLogChanged) {
             throw new IllegalStateException("支付流水状态更新失败");
         }
@@ -356,13 +364,13 @@ public class PaymentServiceImpl implements IPaymentService {
 
         log.info("支付成功: orderId={}, tradeNo={}, amount={}分", orderId, tradeNo, payLog.getAmount());
 
-        // 4. 发送支付成功通知到PAY_NOTIFY_QUEUE
+        // 4. 发送支付成功通知（经Outbox表，由TransactionOutboxPublisher投递到PAY_NOTIFY_QUEUE）
         Map<String, Object> notifyMsg = new HashMap<>();
         notifyMsg.put("orderId", orderId);
         notifyMsg.put("userId", order.getUserId());
         notifyMsg.put("amount", payLog.getAmount());
         notifyMsg.put("tradeNo", tradeNo);
-        saveOutboxEvent("pay-notify:" + tradeNo,
+        outboxWriter.save("pay-notify:" + tradeNo,
                 TransactionOutboxPublisher.PAY_NOTIFY, orderId, notifyMsg);
 
         return Result.ok("支付成功");
@@ -484,13 +492,7 @@ public class PaymentServiceImpl implements IPaymentService {
                 scheduleRedisCompensation(order);
                 return Result.ok("退款已处理");
             }
-            boolean lateRefunded = payLogService.update()
-                    .set("status", 4)
-                    .set("pending_flag", null)
-                    .set("refund_time", LocalDateTime.now())
-                    .eq("id", payLog.getId())
-                    .eq("status", 2)
-                    .update();
+            boolean lateRefunded = markPayLogRefunded(payLog.getId());
             if (!lateRefunded) {
                 return Result.fail("退款流水状态异常");
             }
@@ -513,13 +515,7 @@ public class PaymentServiceImpl implements IPaymentService {
         if (!changed) {
             return Result.fail("当前订单状态不允许退款完成");
         }
-        boolean payLogChanged = payLogService.update()
-                .set("status", 4)
-                .set("pending_flag", null)
-                .set("refund_time", LocalDateTime.now())
-                .eq("id", payLog.getId())
-                .eq("status", 2)
-                .update();
+        boolean payLogChanged = markPayLogRefunded(payLog.getId());
         if (!payLogChanged) {
             throw new IllegalStateException("退款流水状态更新失败");
         }
@@ -544,7 +540,7 @@ public class PaymentServiceImpl implements IPaymentService {
         compensation.put("id", order.getId());
         compensation.put("userId", order.getUserId());
         compensation.put("voucherId", order.getVoucherId());
-        saveOutboxEvent("redis-compensation:" + order.getId(),
+        outboxWriter.save("redis-compensation:" + order.getId(),
                 TransactionOutboxPublisher.REDIS_COMPENSATION, order.getId(), compensation);
 
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
@@ -565,26 +561,33 @@ public class PaymentServiceImpl implements IPaymentService {
         refundMsg.put("tradeNo", payLog.getTradeNo());
         refundMsg.put("userId", order.getUserId());
         refundMsg.put("amount", payLog.getAmount());
-        saveOutboxEvent("refund:" + payLog.getTradeNo(),
+        outboxWriter.save("refund:" + payLog.getTradeNo(),
                 TransactionOutboxPublisher.REFUND, order.getId(), refundMsg);
     }
 
-    private void saveOutboxEvent(String eventKey, String eventType,
-                                 Long aggregateId, Map<String, Object> payload) {
-        TransactionOutbox event = new TransactionOutbox();
-        event.setEventKey(eventKey);
-        event.setEventType(eventType);
-        event.setAggregateId(aggregateId);
-        event.setPayload(JSONUtil.toJsonStr(payload));
-        event.setStatus(0);
-        event.setRetryCount(0);
-        event.setNextRetryTime(LocalDateTime.now());
-        event.setCreateTime(LocalDateTime.now());
-        event.setUpdateTime(LocalDateTime.now());
-        try {
-            outboxMapper.insert(event);
-        } catch (org.springframework.dao.DuplicateKeyException duplicate) {
-            log.info("Outbox事件已存在，忽略重复写入: eventKey={}", eventKey);
-        }
+    /**
+     * 支付流水置为成功（status=2），条件更新保证只从"待支付(1)"迁移，幂等防并发重复回调
+     */
+    private boolean markPayLogPaid(Long payLogId) {
+        return payLogService.update()
+                .set("status", 2)
+                .set("pending_flag", null)
+                .set("pay_time", LocalDateTime.now())
+                .eq("id", payLogId)
+                .eq("status", 1)
+                .update();
+    }
+
+    /**
+     * 支付流水置为已退款（status=4），条件更新保证只从"已支付成功(2)"迁移
+     */
+    private boolean markPayLogRefunded(Long payLogId) {
+        return payLogService.update()
+                .set("status", 4)
+                .set("pending_flag", null)
+                .set("refund_time", LocalDateTime.now())
+                .eq("id", payLogId)
+                .eq("status", 2)
+                .update();
     }
 }

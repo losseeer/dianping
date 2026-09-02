@@ -1,8 +1,8 @@
-"""Agent2 file logging and structured workflow events.
+"""Agent2 structured workflow event logging.
 
-The normal application logger is written to ``agent2/log/agent2.log``.
-Workflow events use a separate JSONL file so one request can be reconstructed
-by filtering on ``requestId``, ``threadId`` or ``trajectoryId``.
+Workflow events are written to ``agent2/log/workflow.jsonl`` (JSONL) so one
+request can be reconstructed by filtering on ``requestId``, ``threadId`` or
+``trajectoryId``.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from typing import Any, Iterator
 
 
 _LOG_DIR = Path(os.getenv("AGENT2_LOG_DIR", Path(__file__).resolve().parents[1] / "log"))
-_APP_LOG = _LOG_DIR / "agent2.log"
 _WORKFLOW_LOG = _LOG_DIR / "workflow.jsonl"
 _MAX_PAYLOAD_CHARS = int(os.getenv("AGENT2_LOG_MAX_PAYLOAD_CHARS", "4000"))
 _FULL_PAYLOADS = os.getenv("AGENT2_LOG_FULL_PAYLOADS", "0").lower() in {"1", "true", "yes", "on"}
@@ -90,16 +89,6 @@ def _safe_value(value: Any, depth: int = 0) -> Any:
         return str(value)
 
 
-class _ContextFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        context = _context()
-        record.request_id = context.get("requestId", "-")
-        record.thread_id = context.get("threadId", "-")
-        record.trajectory_id = context.get("trajectoryId", "-")
-        record.user_id = context.get("userId", "-")
-        return True
-
-
 class _WorkflowFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         event = getattr(record, "workflow_event", "log")
@@ -123,21 +112,6 @@ def configure_logging() -> None:
         return
 
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    level_name = os.getenv("AGENT2_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-
-    root = logging.getLogger()
-    root.setLevel(level)
-    app_handler = RotatingFileHandler(
-        _APP_LOG, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"
-    )
-    app_handler.setLevel(level)
-    app_handler.addFilter(_ContextFilter())
-    app_handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s "
-        "[request=%(request_id)s user=%(user_id)s thread=%(thread_id)s trajectory=%(trajectory_id)s] %(message)s"
-    ))
-    root.addHandler(app_handler)
 
     workflow_logger = logging.getLogger("agent2.workflow")
     workflow_logger.setLevel(logging.INFO)

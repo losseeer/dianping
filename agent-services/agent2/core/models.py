@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, Literal
 from datetime import datetime
 
@@ -45,7 +45,12 @@ class TrajectoryNodeLog(BaseModel):
 
 
 class DecisionLog(BaseModel):
-    """LLM 决策日志 — Decision Observability"""
+    """LLM 决策日志 — Decision Observability
+
+    extra="allow"：各节点（plan/evaluate/replan_relax）会附带自己的扩展字段
+    （intent_analysis、candidateCount、originalParams 等），验证时保留而非静默丢弃。
+    """
+    model_config = ConfigDict(extra="allow")
     node: str
     decision: str = ""
     reasoning: str = ""

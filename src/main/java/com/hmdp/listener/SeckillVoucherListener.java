@@ -10,7 +10,10 @@ import com.hmdp.utils.ConfirmedRabbitPublisher;
 import com.hmdp.utils.RedisConstants;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.MessagePostProcessor;
+import org.springframework.data.redis.connection.RedisConnection;
+import org.springframework.data.redis.connection.RedisStreamCommands;
 import org.springframework.data.redis.connection.stream.Consumer;
+import org.springframework.data.redis.connection.stream.PendingMessage;
 import org.springframework.data.redis.connection.stream.ByteRecord;
 import org.springframework.data.redis.connection.stream.PendingMessages;
 import org.springframework.data.redis.connection.stream.MapRecord;
@@ -29,7 +32,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.lang.management.ManagementFactory;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -60,13 +66,15 @@ public class SeckillVoucherListener {
 
     private static final int PENDING_BATCH_SIZE = 20;
     private static final int MAX_PENDING_SCAN = 200;
+    /** 只认领空闲超过该时长的消息：避免抢走其他实例正在处理中的消息（处理慢≠崩溃） */
+    private static final Duration IDLE_CLAIM_THRESHOLD = Duration.ofSeconds(30);
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r, "seckill-order-consumer");
         thread.setDaemon(true);
         return thread;
     });
-    private final String consumerName = "order-" + java.lang.management.ManagementFactory
+    private final String consumerName = "order-" + ManagementFactory
             .getRuntimeMXBean().getName().replace('@', '-');
     private volatile boolean running = true;
     private String ownPendingCursor = "0";
@@ -165,47 +173,7 @@ public class SeckillVoucherListener {
         // 不会抢走仍在正常处理中的消息(处理慢≠崩溃)
         int scanned = 0;
         while (scanned < MAX_PENDING_SCAN) {
-            final Range<String> range = abandonedPendingCursor == null
-                    ? Range.unbounded()
-                    : Range.rightUnbounded(Range.Bound.exclusive(abandonedPendingCursor));
-            PendingBatch batch = stringRedisTemplate.execute(
-                    (RedisCallback<PendingBatch>) connection -> {
-                    PendingMessages pending = connection.xPending(
-                            RedisConstants.SECKILL_ORDER_STREAM_KEY.getBytes(StandardCharsets.UTF_8),
-                            RedisConstants.SECKILL_ORDER_STREAM_GROUP, range,
-                            (long) PENDING_BATCH_SIZE);
-                    if (pending.isEmpty()) {
-                        return PendingBatch.empty();
-                    }
-                    List<String> ids = pending.stream()
-                            .filter(message -> message.getElapsedTimeSinceLastDelivery().compareTo(
-                                    Duration.ofSeconds(30)) >= 0)
-                            .map(message -> message.getIdAsString())
-                            .collect(Collectors.toList());
-                    if (ids.isEmpty()) {
-                        return new PendingBatch(java.util.Collections.emptyList(),
-                                pending.get(pending.size() - 1).getIdAsString(), pending.size());
-                    }
-                    List<ByteRecord> records = connection.xClaim(
-                            RedisConstants.SECKILL_ORDER_STREAM_KEY.getBytes(StandardCharsets.UTF_8),
-                            RedisConstants.SECKILL_ORDER_STREAM_GROUP,
-                            consumerName,
-                            org.springframework.data.redis.connection.RedisStreamCommands.XClaimOptions
-                                    .minIdle(Duration.ofSeconds(30))
-                                    .ids(ids.toArray(new String[0])));
-                    List<MapRecord<String, Object, Object>> claimed = new java.util.ArrayList<>();
-                    for (ByteRecord record : records) {
-                        MapRecord<String, String, String> deserialized = record.deserialize(
-                                stringRedisTemplate.getStringSerializer(),
-                                stringRedisTemplate.getStringSerializer(),
-                                stringRedisTemplate.getStringSerializer());
-                        @SuppressWarnings({"unchecked", "rawtypes"})
-                        MapRecord<String, Object, Object> converted = (MapRecord) deserialized;
-                        claimed.add(converted);
-                    }
-                    return new PendingBatch(claimed,
-                            pending.get(pending.size() - 1).getIdAsString(), pending.size());
-                });
+            PendingBatch batch = readAbandonedBatch();
             if (batch == null || batch.scanned == 0) {
                 abandonedPendingCursor = null;
                 return;
@@ -218,6 +186,57 @@ public class SeckillVoucherListener {
                 return;
             }
         }
+    }
+
+    /**
+     * 扫一轮"其他实例遗留"的PENDING消息：XPENDING列出 → 过滤空闲超30s的 → XCLAIM认领并反序列化。
+     */
+    private PendingBatch readAbandonedBatch() {
+        final Range<String> range = abandonedPendingCursor == null
+                ? Range.unbounded()
+                : Range.rightUnbounded(Range.Bound.exclusive(abandonedPendingCursor));
+        return stringRedisTemplate.execute((RedisCallback<PendingBatch>) connection -> {
+            PendingMessages pending = connection.xPending(
+                    RedisConstants.SECKILL_ORDER_STREAM_KEY.getBytes(StandardCharsets.UTF_8),
+                    RedisConstants.SECKILL_ORDER_STREAM_GROUP, range,
+                    (long) PENDING_BATCH_SIZE);
+            if (pending.isEmpty()) {
+                return PendingBatch.empty();
+            }
+            List<String> idleIds = pending.stream()
+                    .filter(message -> message.getElapsedTimeSinceLastDelivery().compareTo(
+                            IDLE_CLAIM_THRESHOLD) >= 0)
+                    .map(PendingMessage::getIdAsString)
+                    .collect(Collectors.toList());
+            String lastId = pending.get(pending.size() - 1).getIdAsString();
+            if (idleIds.isEmpty()) {
+                return new PendingBatch(Collections.emptyList(), lastId, pending.size());
+            }
+            return new PendingBatch(claimRecords(connection, idleIds), lastId, pending.size());
+        });
+    }
+
+    /**
+     * XCLAIM认领消息并反序列化为 MapRecord（ByteRecord → StringSerializer 解码）
+     */
+    private List<MapRecord<String, Object, Object>> claimRecords(
+            RedisConnection connection, List<String> ids) {
+        List<ByteRecord> records = connection.xClaim(
+                RedisConstants.SECKILL_ORDER_STREAM_KEY.getBytes(StandardCharsets.UTF_8),
+                RedisConstants.SECKILL_ORDER_STREAM_GROUP,
+                consumerName,
+                RedisStreamCommands.XClaimOptions.minIdle(IDLE_CLAIM_THRESHOLD).ids(ids.toArray(new String[0])));
+        List<MapRecord<String, Object, Object>> claimed = new ArrayList<>();
+        for (ByteRecord record : records) {
+            MapRecord<String, String, String> deserialized = record.deserialize(
+                    stringRedisTemplate.getStringSerializer(),
+                    stringRedisTemplate.getStringSerializer(),
+                    stringRedisTemplate.getStringSerializer());
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            MapRecord<String, Object, Object> converted = (MapRecord) deserialized;
+            claimed.add(converted);
+        }
+        return claimed;
     }
 
     private void processRecords(List<MapRecord<String, Object, Object>> records) {
@@ -313,7 +332,7 @@ public class SeckillVoucherListener {
         }
 
         private static PendingBatch empty() {
-            return new PendingBatch(java.util.Collections.emptyList(), null, 0);
+            return new PendingBatch(Collections.emptyList(), null, 0);
         }
     }
 }

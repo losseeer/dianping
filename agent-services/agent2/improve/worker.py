@@ -14,6 +14,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from core.llm import reset_token_usage
 from memory.trajectory import trajectory_store
@@ -25,6 +26,7 @@ from improve.signals import (
     mark_processed,
     piggyback_should_run,
     piggyback_mark_started,
+    MIN_COOL_SECONDS,
 )
 from improve.distill import playbook_distill, preference_distill
 from core.observability import workflow_event
@@ -33,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 PIGGYBACK_MAX = 4          # piggyback 单次最多处理 4 条（避免主线程被拖太久）
 PIGGYBACK_TIME_BUDGET = 2.5  # piggyback 单轮最多跑 2.5s，超了就留给下轮/CLI
+DAEMON_INTERVAL_SECONDS = 300   # 兜底 daemon loop：5 分钟跑一批
+DAEMON_BATCH_SIZE = 16
 
 
 @dataclass
@@ -46,10 +50,18 @@ class WorkerStats:
     elapsed_ms: float = 0.0
 
 
-async def process_pending_batch(max_items: int = 8, min_cool_seconds: int = 60) -> WorkerStats:
+async def process_pending_batch(
+    max_items: int = 8,
+    min_cool_seconds: int = 60,
+    time_budget: float | None = None,
+    mode: str = "daemon_or_cli",
+) -> WorkerStats:
     """
     主处理逻辑：从 pending zset 拉一批→信号判定→蒸馏→写库→标记 processed。
     单条异常不影响其它条。
+
+    time_budget：单轮时间预算（秒），每条处理前检查，超了停止、剩余留给下一轮
+    （piggyback 路径用它保证不拖慢主服务）。
     """
     stats = WorkerStats()
     t0 = time.perf_counter()
@@ -57,7 +69,7 @@ async def process_pending_batch(max_items: int = 8, min_cool_seconds: int = 60) 
     ids = pop_pending_batch(max_items=max_items, min_cool_seconds=min_cool_seconds)
     workflow_event(
         "distill.batch_started",
-        mode="daemon_or_cli",
+        mode=mode,
         requestedCount=max_items,
         selectedCount=len(ids),
     )
@@ -66,6 +78,10 @@ async def process_pending_batch(max_items: int = 8, min_cool_seconds: int = 60) 
         return stats
 
     for tid in ids:
+        # 单轮时间预算超了 → 停，剩余留给下一轮
+        if time_budget is not None and (time.perf_counter() - t0) > time_budget:
+            logger.info("Distill time budget exceeded; leaving remaining for next round.")
+            break
         stats.scanned += 1
         try:
             record = trajectory_store.get(tid)
@@ -111,12 +127,13 @@ async def process_pending_batch(max_items: int = 8, min_cool_seconds: int = 60) 
             workflow_event(
                 "distill.trajectory_completed",
                 trajectoryId=tid,
+                mode=mode,
                 preferenceUpdated=preference_updated,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"distill worker failed for trajectory {tid}: {e}")
+            logger.warning(f"distill failed [{mode}] for trajectory {tid}: {e}")
             stats.errored += 1
-            workflow_event("distill.trajectory_failed", level=logging.ERROR, trajectoryId=tid, errorType=type(e).__name__, error=str(e))
+            workflow_event("distill.trajectory_failed", level=logging.ERROR, trajectoryId=tid, mode=mode, errorType=type(e).__name__, error=str(e))
             try:
                 mark_processed(tid, f"error:{type(e).__name__}")
             except Exception:  # noqa: BLE001
@@ -125,14 +142,14 @@ async def process_pending_batch(max_items: int = 8, min_cool_seconds: int = 60) 
     stats.elapsed_ms = (time.perf_counter() - t0) * 1000
     if stats.scanned:
         logger.info(
-            "Distill worker batch done: scanned=%d playbook_added=%d pref_users=%d "
+            "Distill batch done [%s]: scanned=%d playbook_added=%d pref_users=%d "
             "skip_no_signal=%d errors=%d elapsed=%.0fms",
-            stats.scanned, stats.playbook_added, stats.pref_updated_users,
+            mode, stats.scanned, stats.playbook_added, stats.pref_updated_users,
             stats.skipped_no_signal, stats.errored, stats.elapsed_ms,
         )
     workflow_event(
         "distill.batch_completed",
-        mode="daemon_or_cli",
+        mode=mode,
         scanned=stats.scanned,
         playbookAdded=stats.playbook_added,
         preferenceUsers=stats.pref_updated_users,
@@ -158,78 +175,94 @@ async def piggyback_scan() -> WorkerStats:
         return WorkerStats()
     piggyback_mark_started()
 
-    t0 = time.perf_counter()
-    stats = WorkerStats()
-    ids = pop_pending_batch(max_items=PIGGYBACK_MAX, min_cool_seconds=60)
-    workflow_event("distill.batch_started", mode="piggyback", requestedCount=PIGGYBACK_MAX, selectedCount=len(ids))
-    if not ids:
-        return stats
-
-    for tid in ids:
-        # 单轮时间预算超了 → 停，剩余留给下一轮
-        if (time.perf_counter() - t0) > PIGGYBACK_TIME_BUDGET:
-            logger.info("Piggyback time budget exceeded; leaving remaining for next round.")
-            break
-        stats.scanned += 1
-        try:
-            record = trajectory_store.get(tid)
-            if record is None:
-                mark_processed(tid, "missing_record")
-                workflow_event("distill.trajectory_skipped", trajectoryId=tid, reason="missing_record")
-                continue
-            accepted = detect_acceptance(record)
-            workflow_event("distill.signal_evaluated", trajectoryId=tid, accepted=accepted, outcome=record.outcome, candidateCount=record.candidateCount, reflectionScore=record.reflectionScore)
-            if not accepted:
-                mark_processed(tid, "no_signal")
-                stats.skipped_no_signal += 1
-                workflow_event("distill.trajectory_skipped", trajectoryId=tid, reason="no_signal")
-                continue
-
-            mappings = playbook_distill(record)
-            if mappings:
-                added = await playbook.add_mapping_entries(mappings, origin_trajectory_id=record.trajectoryId)
-                stats.playbook_added += added
-            preference_updated = False
-            if record.userId > 0:
-                patch = preference_distill(record)
-                if patch:
-                    await save_user_preferences(record.userId, patch)
-                    stats.pref_updated_users += 1
-                    preference_updated = True
-            mark_processed(tid, "ok")
-            workflow_event(
-                "distill.trajectory_completed",
-                trajectoryId=tid,
-                mode="piggyback",
-                preferenceUpdated=preference_updated,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Piggyback distill failed for {tid}: {e}")
-            stats.errored += 1
-            workflow_event("distill.trajectory_failed", level=logging.ERROR, trajectoryId=tid, mode="piggyback", errorType=type(e).__name__, error=str(e))
-            try:
-                mark_processed(tid, f"error:{type(e).__name__}")
-            except Exception:  # noqa: BLE001
-                pass
-
-    stats.elapsed_ms = (time.perf_counter() - t0) * 1000
-    if stats.scanned:
-        logger.info(
-            "Piggyback distill: scanned=%d +playbook=%d +pref_users=%d skip_no_signal=%d err=%d elapsed=%.0fms",
-            stats.scanned, stats.playbook_added, stats.pref_updated_users,
-            stats.skipped_no_signal, stats.errored, stats.elapsed_ms,
-        )
-    workflow_event(
-        "distill.batch_completed",
+    return await process_pending_batch(
+        max_items=PIGGYBACK_MAX,
+        min_cool_seconds=MIN_COOL_SECONDS,
+        time_budget=PIGGYBACK_TIME_BUDGET,
         mode="piggyback",
-        scanned=stats.scanned,
-        playbookAdded=stats.playbook_added,
-        preferenceUsers=stats.pref_updated_users,
-        skippedNoSignal=stats.skipped_no_signal,
-        errors=stats.errored,
-        elapsedMs=round(stats.elapsed_ms, 1),
     )
-    return stats
+
+
+# ---------- Daemon Loop（兜底后台任务，FastAPI 生命周期管理）----------
+
+_DAEMON_TASK_KEY = "_distill_daemon_task"
+
+
+async def _distill_daemon_loop(
+    interval_seconds: int = DAEMON_INTERVAL_SECONDS,
+    batch_size: int = DAEMON_BATCH_SIZE,
+) -> None:
+    """
+    后台 asyncio 循环：每 `interval_seconds` 秒调一次 `process_pending_batch`（兜底策略）。
+    与 Piggyback（近实时）互补：
+      · 用户流量正常 → Piggyback 先跑，Daemon loop 通常看到空批。
+      · 异常（LLM 慢导致请求线阻塞、或重启漏跑一批）→ Daemon loop 5 min 后补捞。
+    """
+    logger.info(
+        "[distill] daemon started — every %ds, batch=%d. "
+        "Piggyback (30s throttle, ≤4 per request) 先跑，本循环作为兜底。",
+        interval_seconds, batch_size,
+    )
+    workflow_event(
+        "distill.daemon_started",
+        intervalSeconds=interval_seconds,
+        batchSize=batch_size,
+    )
+    while True:
+        try:
+            stats = await process_pending_batch(max_items=batch_size, min_cool_seconds=MIN_COOL_SECONDS)
+            if stats.scanned:
+                logger.info(
+                    "[distill] daemon tick: scanned=%d playbook_added=%d pref_users=%d "
+                    "skip_no_signal=%d errors=%d elapsed=%.0fms",
+                    stats.scanned, stats.playbook_added, stats.pref_updated_users,
+                    stats.skipped_no_signal, stats.errored, stats.elapsed_ms,
+                )
+        except asyncio.CancelledError:
+            logger.info("[distill] daemon stopped (cancelled).")
+            workflow_event("distill.daemon_stopped")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.error("[distill] daemon tick failed (will retry after %ds): %s", interval_seconds, e)
+            workflow_event("distill.daemon_tick_failed", level=logging.ERROR, errorType=type(e).__name__, error=str(e))
+        await asyncio.sleep(interval_seconds)
+
+
+def start_distill_daemon(app: Any, interval_seconds: int = DAEMON_INTERVAL_SECONDS, batch_size: int = DAEMON_BATCH_SIZE) -> asyncio.Task:
+    """
+    在 FastAPI 启动时调用：创建 daemon task，挂到 app.state 上，shutdown 时 cancel。
+    用法：
+        @app.on_event("startup")
+        async def _startup():
+            app.state._distill_daemon = start_distill_daemon(app)
+
+        @app.on_event("shutdown")
+        async def _shutdown():
+            t = getattr(app.state, "_distill_daemon", None)
+            if t and not t.done(): t.cancel()
+    """
+    task = asyncio.create_task(
+        _distill_daemon_loop(interval_seconds=interval_seconds, batch_size=batch_size),
+        name="agent2-distill-daemon",
+    )
+    setattr(app.state, _DAEMON_TASK_KEY, task)
+
+    def _log_done(t: asyncio.Task) -> None:
+        try:
+            t.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.error("[distill] daemon exited with exception (NOT restarted): %s", e)
+    task.add_done_callback(_log_done)
+    return task
+
+
+def cancel_distill_daemon(app: Any) -> None:
+    """shutdown 时调用：取消 daemon task。对已取消/已完成任务安全。"""
+    t = getattr(app.state, _DAEMON_TASK_KEY, None)
+    if t and not t.done():
+        t.cancel()
 
 
 # ---------- CLI ----------
@@ -245,16 +278,13 @@ async def _run_once(max_items: int) -> int:
 
 
 async def _run_loop(interval_seconds: int, max_items: int) -> int:
+    """CLI 长轮询模式：复用与 in-process daemon 相同的循环，只是入口从命令行启动。"""
     print(f"[distill] loop mode: every {interval_seconds}s, batch={max_items} (Ctrl+C to stop)")
-    while True:
-        try:
-            await _run_once(max_items)
-        except KeyboardInterrupt:
-            print("\n[distill] stopped by user")
-            return 0
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Distill loop tick failed: {e}")
-        await asyncio.sleep(interval_seconds)
+    try:
+        await _distill_daemon_loop(interval_seconds=interval_seconds, batch_size=max_items)
+    except KeyboardInterrupt:
+        print("\n[distill] stopped by user")
+    return 0
 
 
 def main() -> int:

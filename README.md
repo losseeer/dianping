@@ -274,7 +274,7 @@ dianping/
 │   └── utils/ (CacheClient 三防 / RedisIdWorker / SimpleRedisLock / UserHolder / PasswordEncoder…)
 ├── src/main/resources/
 │   ├── application.yaml                     # 含 elasticsearch.init.rebuild-on-startup
-│   ├── seckill.lua / unLock.lua
+│   ├── seckill.lua / unlock.lua
 │   ├── synonyms.txt                         # 14 组中文同义词，供 synonym_graph 消费
 │   └── mapper/VoucherMapper.xml
 ├── sql/ (按服务分层)

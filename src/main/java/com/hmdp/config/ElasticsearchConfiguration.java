@@ -11,8 +11,8 @@ import com.hmdp.entity.Shop;
 import com.hmdp.repository.ShopDocRepository;
 import com.hmdp.service.IShopSearchService;
 import com.hmdp.service.IShopService;
+import com.hmdp.utils.ShopDocConverter;
 import lombok.extern.slf4j.Slf4j;
-import org.elasticsearch.action.admin.indices.alias.IndicesAliasesRequest;
 import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
 import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
@@ -307,24 +307,7 @@ public class ElasticsearchConfiguration implements ApplicationRunner {
         }
         List<ShopDoc> docs = new ArrayList<>(all.size());
         for (Shop s : all) {
-            ShopDoc d = new ShopDoc();
-            d.setId(s.getId());
-            d.setName(s.getName());
-            d.setTypeId(s.getTypeId());
-            d.setImages(s.getImages());
-            d.setArea(s.getArea());
-            d.setAddress(s.getAddress());
-            d.setX(s.getX());
-            d.setY(s.getY());
-            d.setAvgPrice(s.getAvgPrice());
-            d.setSold(s.getSold());
-            d.setComments(s.getComments());
-            d.setScore(s.getScore() != null ? Math.round(s.getScore() * 10) : null); // 乘10存
-            d.setOpenHours(s.getOpenHours());
-            // 【注意】MySQL tb_shop 实体没有 tags 字段。与 ShopSearchServiceImpl.convertToShopDoc 保持一致：
-            // 用 area 兜底作为 ES tags，让同义词扩展（如日料→寿司/居酒屋）能在 tags 侧也命中。
-            d.setTags(s.getArea());
-            docs.add(d);
+            docs.add(ShopDocConverter.fromShop(s));
         }
         shopDocRepository.saveAll(docs);
         log.info("[ES] MySQL → ES 导入完成：{} 条商铺。", docs.size());

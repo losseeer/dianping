@@ -1,5 +1,7 @@
 """
-信号管线：轨迹「接受信号」判定 + 待处理队列 + 幂等去重标记 + 后台蒸馏 daemon。
+信号管线：轨迹「接受信号」判定 + 待处理队列 + 幂等去重标记。
+
+蒸馏消费者（piggyback / daemon / CLI）在 improve/worker.py。
 
 队列设计（纯 Redis，零依赖）：
   - PENDING_ZSET    ：待蒸馏队列（zset，score = 轨迹落盘秒级时间戳，value = trajectory_id）
@@ -16,7 +18,7 @@ ZSet 的 score 天然支持「按时间取已到期任务」：ZRANGEBYSCORE(0, 
 
 蒸馏执行 — 双保险：
   A) Piggyback（近实时）：每次轨迹落盘入队后 fire-and-forget 触发一批，≥30s 节流，单轮 ≤2.5s / ≤4 条。
-  B) Daemon loop（兜底）：FastAPI 启动时起一个后台 asyncio 任务，每 5 分钟扫一批（≤16 条），保证 piggyback 没来得及跑的也会被兜底处理。
+  B) Daemon loop（兜底，见 worker.py）：FastAPI 启动时起一个后台 asyncio 任务，每 5 分钟扫一批（≤16 条），保证 piggyback 没来得及跑的也会被兜底处理。
 
 信号策略（阶段 4）：
   「用户接受推荐」→ 作为 Playbook 蒸馏的 ground-truth 信号。
@@ -30,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
 
 from core.config import config
 from core.redis import get_redis
@@ -50,8 +51,6 @@ MIN_COOL_SECONDS = 60           # 轨迹落盘后至少 60s 才蒸馏（等用�
 # 冷却 60s 给显式反馈留出到达窗口，之后再做信号判定——宁可晚学，不学错
 PIGGYBACK_MIN_INTERVAL = 30     # piggyback 扫描最少间隔 30s（避免大流量下反复扫）
 MAX_PER_BATCH = 8
-DAEMON_INTERVAL_SECONDS = 300   # 兜底 daemon loop：5 分钟跑一批
-DAEMON_BATCH_SIZE = 16
 
 _acceptance_negative_outcomes = {"rejected", "timeout"}
 
@@ -193,83 +192,6 @@ def piggyback_mark_started() -> None:
 
 
 # ---------- Daemon Loop（兜底后台任务）----------
-
-_DAEMON_TASK_KEY = "_distill_daemon_task"
-
-
-async def _distill_daemon_loop(
-    interval_seconds: int = DAEMON_INTERVAL_SECONDS,
-    batch_size: int = DAEMON_BATCH_SIZE,
-) -> None:
-    """
-    后台 asyncio 循环：每 `interval_seconds` 秒调一次 `process_pending_batch`（兜底策略）。
-    与 Piggyback（近实时）互补：
-      · 用户流量正常 → Piggyback 先跑，Daemon loop 通常看到空批。
-      · 异常（LLM 慢导致请求线阻塞、或重启漏跑一批）→ Daemon loop 5 min 后补捞。
-    """
-    from improve.worker import process_pending_batch  # 延迟 import 避免循环
-    logger.info(
-        "[distill] daemon started — every %ds, batch=%d. "
-        "Piggyback (30s throttle, ≤4 per request) 先跑，本循环作为兜底。",
-        interval_seconds, batch_size,
-    )
-    workflow_event(
-        "distill.daemon_started",
-        intervalSeconds=interval_seconds,
-        batchSize=batch_size,
-    )
-    while True:
-        try:
-            stats = await process_pending_batch(max_items=batch_size, min_cool_seconds=MIN_COOL_SECONDS)
-            if stats.scanned:
-                logger.info(
-                    "[distill] daemon tick: scanned=%d playbook_added=%d pref_users=%d "
-                    "skip_no_signal=%d errors=%d elapsed=%.0fms",
-                    stats.scanned, stats.playbook_added, stats.pref_updated_users,
-                    stats.skipped_no_signal, stats.errored, stats.elapsed_ms,
-                )
-        except asyncio.CancelledError:
-            logger.info("[distill] daemon stopped (cancelled).")
-            workflow_event("distill.daemon_stopped")
-            return
-        except Exception as e:  # noqa: BLE001
-            logger.error("[distill] daemon tick failed (will retry after %ds): %s", interval_seconds, e)
-            workflow_event("distill.daemon_tick_failed", level=logging.ERROR, errorType=type(e).__name__, error=str(e))
-        await asyncio.sleep(interval_seconds)
-
-
-def start_distill_daemon(app: Any, interval_seconds: int = DAEMON_INTERVAL_SECONDS, batch_size: int = DAEMON_BATCH_SIZE) -> asyncio.Task:
-    """
-    在 FastAPI 启动时调用：创建 daemon task，挂到 app.state 上，shutdown 时 cancel。
-    用法：
-        @app.on_event("startup")
-        async def _startup():
-            app.state._distill_daemon = start_distill_daemon(app)
-
-        @app.on_event("shutdown")
-        async def _shutdown():
-            t = getattr(app.state, "_distill_daemon", None)
-            if t and not t.done(): t.cancel()
-    """
-    task = asyncio.create_task(
-        _distill_daemon_loop(interval_seconds=interval_seconds, batch_size=batch_size),
-        name="agent2-distill-daemon",
-    )
-    setattr(app.state, _DAEMON_TASK_KEY, task)
-
-    def _log_done(t: asyncio.Task) -> None:
-        try:
-            t.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:  # noqa: BLE001
-            logger.error("[distill] daemon exited with exception (NOT restarted): %s", e)
-    task.add_done_callback(_log_done)
-    return task
-
-
-def cancel_distill_daemon(app: Any) -> None:
-    """shutdown 时调用：取消 daemon task。对已取消/已完成任务安全。"""
-    t = getattr(app.state, _DAEMON_TASK_KEY, None)
-    if t and not t.done():
-        t.cancel()
+# 【已迁移】daemon loop 及其生命周期管理移至 improve/worker.py——它与 piggyback
+# 同为「队列消费者」，区别只在触发方式（定时 vs 捎带），实现归档应在同一模块。
+# 本文件只保留队列原语与信号判定。

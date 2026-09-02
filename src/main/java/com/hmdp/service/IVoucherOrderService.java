@@ -43,19 +43,6 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
     void evictPendingOrder(Long orderId, Long userId);
 
     /**
-     * 用户发起支付 —— 委托给PaymentService处理
-     * 【八股：为什么要委托而不是直接在OrderService里实现？】
-     * 1. 单一职责：OrderService管订单生命周期，PaymentService管支付细节
-     * 2. 解耦：支付逻辑变动（比如换SDK）不影响订单服务
-     * 3. 门面模式：对外暴露统一入口，内部转发到专门的支付服务
-     *
-     * @param orderId 订单ID
-     * @param payType 支付方式（1余额 2支付宝 3微信）
-     * @return 支付链接/二维码URL
-     */
-    Result payOrder(Long orderId, Integer payType);
-
-    /**
      * 查询订单详情（包含优惠券信息）
      * 【八股：为什么查询要联表？】
      * 订单表只存了voucherId，用户还需要知道优惠券标题、金额等信息
@@ -91,18 +78,6 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
      * @return 取消结果
      */
     Result cancelOrder(Long orderId);
-
-    /**
-     * 申请退款 —— 委托给PaymentService处理
-     * 【八股：退款前置条件】
-     * 只有已支付(PAID)的订单才能退款
-     * 已核销(VERIFIED)的订单不能退款（已消费）
-     * 已取消(CANCELLED)的订单不需要退款（没付钱）
-     *
-     * @param orderId 订单ID
-     * @return 退款申请结果
-     */
-    Result refundOrder(Long orderId);
 
     /**
      * 处理超时订单（MQ延迟队列回调）

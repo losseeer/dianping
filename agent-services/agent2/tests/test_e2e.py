@@ -27,10 +27,10 @@ async def run_test():
     # Mock get_review_summary（Agent1 未启动时避免连接失败）
     import graph.nodes as gn
     _orig_exec = gn.execute_tool
-    async def _patched(tool_name, params):
+    async def _patched(tool_name, params, state=None):
         if tool_name == "get_review_summary":
             return {"recommendation": "评价分析中", "topPros": [], "topCons": []}
-        return await _orig_exec(tool_name, params)
+        return await _orig_exec(tool_name, params, state)
     gn.execute_tool = _patched
 
     # ---- 导入核心模块 ----

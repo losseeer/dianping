@@ -1,10 +1,6 @@
 package com.hmdp.service.impl;
 
-import cn.hutool.core.bean.BeanUtil;
-import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
-import cn.hutool.json.JSONObject;
-import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
@@ -13,9 +9,7 @@ import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisConstants;
-import com.hmdp.utils.RedisData;
 import com.hmdp.utils.SystemConstants;
-import org.springframework.dao.IncorrectResultSizeDataAccessException;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
 import org.springframework.data.geo.GeoResults;
@@ -25,15 +19,9 @@ import org.springframework.data.redis.domain.geo.GeoReference;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import javax.annotation.Generated;
 import javax.annotation.Resource;
-import java.time.LocalDateTime;
 import java.util.*;
-import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.LongStream;
 
 import static com.hmdp.utils.RedisConstants.*;
 
@@ -52,16 +40,16 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     private StringRedisTemplate stringRedisTemplate;
 
     @Resource
-    private CacheClient clientClient;
+    private CacheClient cacheClient;
     @Override
     public Result queryById(Long id){
         // 先用逻辑过期策略查缓存（热点key场景）
-        Shop shop = clientClient.
+        Shop shop = cacheClient.
                 queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
         // 逻辑过期策略前提是缓存已预热；如果缓存未命中（非热点/首次访问/Redis未启动），
         // 再走缓存穿透策略兜底，该策略会主动查DB并回填缓存，方便联调。
         if (shop == null) {
-            shop = clientClient
+            shop = cacheClient
                     .queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
         }
         if(shop==null){
@@ -71,30 +59,8 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     }
 
-    private static final ExecutorService CACHE_REBUILD_EXECUTOR= Executors.newFixedThreadPool(10);
-    // 【八股：防击穿两方案对比——互斥锁 vs 逻辑过期】
-    // 旧版把三套查询实现内嵌在本类里（已删，git 历史可查），现统一收敛到 CacheClient 工具类：
-    // - 互斥锁版：缓存失效时 setnx 抢锁，仅一个线程查库重建，其他线程休眠重试
-    //   一致性强；缺点是重建期间请求阻塞、递归重试有栈溢出风险（需改成循环）
-    // - 逻辑过期版（当前启用）：value 内嵌过期时间字段，key 无物理 TTL 永不失效；
-    //   发现逻辑过期 → 抢到锁的线程异步重建，所有请求立即返回旧数据——用一致性换可用性
-    // 选型：商品详情等热点数据允许秒级不一致，用逻辑过期；交易强一致数据用互斥锁或直查DB
-    // 注意：上方 CACHE_REBUILD_EXECUTOR 字段是旧实现遗留、当前无人引用，属待清理代码
-
-
     // 【八股：缓存预热】逻辑过期方案的前提：热点key必须在流量到来前主动写入Redis，
-    // 否则第一次访问必然miss，防击穿无从谈起（配合 queryById 的穿透兜底形成双保险）
-    public void saveShop2Redis(Long id,Long expireSeconds) throws InterruptedException {
-        //1.查询店铺数据
-        Shop shop = getById(id);
-        Thread.sleep(200);
-        //2.封装成逻辑过期
-        RedisData redisData = new RedisData();
-        redisData.setData(shop);
-        redisData.setExpireTime(LocalDateTime.now().plusSeconds(expireSeconds));
-        //3.写入Redis
-        stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY+id,JSONUtil.toJsonStr(redisData));
-    }
+    // 否则第一次访问必然miss，防击穿无从谈起（当前项目配合 queryById 的穿透兜底形成双保险）
 
     @Override
     @Transactional

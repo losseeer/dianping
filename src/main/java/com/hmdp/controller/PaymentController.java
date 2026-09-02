@@ -4,7 +4,6 @@ import com.hmdp.annotation.RateLimit;
 import com.hmdp.dto.PaymentDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.service.IPaymentService;
-import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.PaymentCallbackVerifier;
 import org.springframework.web.bind.annotation.*;
 
@@ -35,9 +34,6 @@ import javax.annotation.Resource;
 public class PaymentController {
 
     @Resource
-    private IVoucherOrderService voucherOrderService;
-
-    @Resource
     private IPaymentService paymentService;
 
     @Resource
@@ -65,7 +61,7 @@ public class PaymentController {
         if (dto == null) {
             return Result.fail("支付参数不能为空");
         }
-        return voucherOrderService.payOrder(dto.getOrderId(), dto.getPayType());
+        return paymentService.payOrder(dto);
     }
 
     /**
@@ -107,7 +103,7 @@ public class PaymentController {
      */
     @PostMapping("/refund/{orderId}")
     public Result refund(@PathVariable Long orderId) {
-        return voucherOrderService.refundOrder(orderId);
+        return paymentService.refundOrder(orderId);
     }
 
     /**
